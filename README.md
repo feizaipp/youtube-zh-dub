@@ -168,4 +168,31 @@ python3 youtube_dub.py --workdir output/full --subtitles-only
 - `sync_report.json`：每段裁剪后自然语音时长、目标时长、最终调速倍率和本轮自动精简记录；
 - `dubbed.zh.mp4`：最终中文配音视频。
 
+## 断点续传最终视频
+
+转录完成并取得最终视频的真实下载 URL 后，可使用下面的命令下载。
+如果下载中断，重新运行同一条命令即可从已有文件继续；服务端需要支持 HTTP
+Range 请求。
+
+Linux：
+
+```bash
+curl -fL -C - --retry 5 --retry-delay 2 -o 'dubbed.zh.mp4' 'DOWNLOAD_URL'
+```
+
+macOS：
+
+```bash
+curl -fL -C - --retry 5 --retry-delay 2 -o 'dubbed.zh.mp4' 'DOWNLOAD_URL'
+```
+
+Windows PowerShell 或命令提示符：
+
+```powershell
+curl.exe -fL -C - --retry 5 --retry-delay 2 -o "dubbed.zh.mp4" "DOWNLOAD_URL"
+```
+
+将 `DOWNLOAD_URL` 替换成最终视频附件或文件服务提供的真实下载地址。本机文件
+路径不是下载 URL；没有可远程访问的 URL 时，不应虚构地址。
+
 MAI-Transcribe 的标准接口不返回词级时间戳。因此原始时间戳精度是“静音感知的片段级”，默认约 15 秒。校对模型只输出有序的完整句子，不生成时间戳；程序依据原始各块的词数密度将句子边界确定性地映射回完整时间轴，中文翻译和配音再严格复用这些边界。

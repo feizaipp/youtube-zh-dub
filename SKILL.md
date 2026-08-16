@@ -83,5 +83,26 @@ After the command succeeds:
 3. Use `ffprobe` to require video, audio, and subtitle streams. Confirm H.264 video, AAC audio, and `mov_text` subtitle codecs.
 4. Decode the full final file with `ffmpeg -v error -i dubbed.zh.mp4 -f null -`; require exit code 0.
 5. Return clickable absolute paths for the final video, Chinese SRT, Chinese JSON audit, and sync report. State the maximum tempo and whether warnings were found.
+6. After successful full-video transcription, also provide resumable download commands for `dubbed.zh.mp4` on all three platforms below. Replace `DOWNLOAD_URL` with the real, remotely reachable URL for the final video when one is available. Never invent a URL or substitute a server-local filesystem path; if the client exposes only a clickable file attachment, keep the placeholder and tell the user to copy that attachment's download URL into the command.
+
+   Linux:
+
+   ```bash
+   curl -fL -C - --retry 5 --retry-delay 2 -o 'dubbed.zh.mp4' 'DOWNLOAD_URL'
+   ```
+
+   macOS:
+
+   ```bash
+   curl -fL -C - --retry 5 --retry-delay 2 -o 'dubbed.zh.mp4' 'DOWNLOAD_URL'
+   ```
+
+   Windows PowerShell or Command Prompt:
+
+   ```powershell
+   curl.exe -fL -C - --retry 5 --retry-delay 2 -o "dubbed.zh.mp4" "DOWNLOAD_URL"
+   ```
+
+   Explain briefly that `-C -` resumes from the existing local file, so rerunning the same command continues an interrupted download. The remote server must support HTTP byte-range requests. Do not offer these final-video commands for debug-only or download-only runs that did not produce `dubbed.zh.mp4`.
 
 If validation fails, diagnose and resume the existing workdir. Do not claim completion until the final file passes these checks.
