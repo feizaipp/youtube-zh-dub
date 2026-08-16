@@ -1,0 +1,4 @@
+interface:
+  display_name: "YouTube 中文配音"
+  short_description: "下载 720p/1080p 资源或制作中文配音字幕视频"
+  default_prompt: "使用 $youtube-zh-dub 转录这个 YouTube 链接，生成完整的中文配音字幕视频。"
