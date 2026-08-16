@@ -79,6 +79,13 @@ def is_download_only(args: argparse.Namespace, passthrough: list[str]) -> bool:
     return args.download_only or option_value(passthrough, "--stop-after") == "download"
 
 
+def needs_codex(args: argparse.Namespace, passthrough: list[str]) -> bool:
+    """Return whether the requested stage reaches a Codex-backed text step."""
+    if is_download_only(args, passthrough):
+        return False
+    return option_value(passthrough, "--stop-after") != "transcribe"
+
+
 def safe_directory_name(title: str, video_id: str) -> str:
     normalized = unicodedata.normalize("NFKC", title)
     normalized = re.sub(r'[<>:"/\\|?*\x00-\x1f\x7f]', "-", normalized)
@@ -276,11 +283,11 @@ def main() -> int:
             file=sys.stderr,
         )
         return 2
-    needs_codex = requested_stop not in ("download", "transcribe")
     required_tools = (
         ("yt-dlp",)
         if args.dry_run
-        else ("yt-dlp", "ffmpeg", "ffprobe") + (("codex",) if needs_codex else ())
+        else ("yt-dlp", "ffmpeg", "ffprobe")
+        + (("codex",) if needs_codex(args, passthrough) else ())
     )
     missing = [
         name

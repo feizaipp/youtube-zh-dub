@@ -2,10 +2,6 @@ import argparse
 import importlib.util
 import unittest
 from pathlib import Path
-from unittest import mock
-
-import download_youtube
-
 
 LAUNCHER_PATH = Path(__file__).resolve().parents[1] / "scripts" / "run_youtube_zh_dub.py"
 SPEC = importlib.util.spec_from_file_location("youtube_zh_dub_launcher", LAUNCHER_PATH)
@@ -36,17 +32,21 @@ class SkillLauncherTests(unittest.TestCase):
             launcher.is_download_only(args, ["--stop-after", "download"])
         )
 
-    def test_project_wrapper_preserves_selected_quality(self):
-        completed = mock.Mock(returncode=0)
-        with mock.patch.object(download_youtube.subprocess, "run", return_value=completed) as run:
-            result = download_youtube.main(
-                ["https://youtu.be/example", "--quality", "720p"]
-            )
-        self.assertEqual(result, 0)
-        command = run.call_args.args[0]
-        self.assertIn("--download-only", command)
-        self.assertEqual(command[command.index("--quality") + 1], "720p")
-        self.assertNotIn("--video-format", command)
+    def test_download_only_does_not_require_codex(self):
+        args = argparse.Namespace(download_only=True)
+        self.assertFalse(launcher.needs_codex(args, []))
+
+    def test_download_stop_stage_does_not_require_codex(self):
+        args = argparse.Namespace(download_only=False)
+        self.assertFalse(launcher.needs_codex(args, ["--stop-after", "download"]))
+
+    def test_transcribe_stop_stage_does_not_require_codex(self):
+        args = argparse.Namespace(download_only=False)
+        self.assertFalse(launcher.needs_codex(args, ["--stop-after", "transcribe"]))
+
+    def test_full_pipeline_requires_codex(self):
+        args = argparse.Namespace(download_only=False)
+        self.assertTrue(launcher.needs_codex(args, []))
 
 
 if __name__ == "__main__":

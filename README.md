@@ -5,12 +5,30 @@
 `SKILL.md`、`agents/` 和 `scripts/` 构成 Skill 包，根目录的 Python 文件是
 其自带的处理流水线。
 
+## 环境要求
+
+- Python 3.10 或更高版本；
+- `ffmpeg`（同时提供 `ffprobe`）；
+- 完整配音需要已安装并登录的 Codex CLI；
+- 完整配音需要通过环境变量提供 `OPENROUTER_API_KEY`；
+- 推荐安装 Node.js，供 `yt-dlp` 处理 YouTube JavaScript 校验。
+
+纯下载模式只需要 Python、`yt-dlp`、`ffmpeg` 和 `ffprobe`，不需要
+OpenRouter Key 或 Codex CLI。
+
 ```bash
 git clone https://github.com/feizaipp/youtube-zh-dub.git \
   ~/.codex/skills/youtube-zh-dub
 cd ~/.codex/skills/youtube-zh-dub
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
+```
+
+安装后重新启动 Codex，使其重新扫描本地 Skills。可先执行不联网的检查：
+
+```bash
+.venv/bin/python scripts/run_youtube_zh_dub.py \
+  'https://youtu.be/dQw4w9WgXcQ' --download-only --dry-run --video-title test
 ```
 
 这个命令行工具完成以下流程：
@@ -56,10 +74,11 @@ export PATH="$PWD/.venv/bin:$PATH"
 python3 youtube_dub.py 'https://www.youtube.com/watch?v=2cTDRKRQ5oc'
 ```
 
-只需一键下载最高质量的独立视频流和独立音频流时，使用项目里的下载脚本。它会自动创建 `output/<视频标题>/`，保留原始视频、原始音频和合并文件，支持 `.part` 断点续传，并且不会读取或调用 `OPENROUTER_API_KEY`：
+只需一键下载最高质量的独立视频流和独立音频流时，使用 Skill 启动器。它会自动创建 `output/<视频标题>/`，保留原始视频、原始音频和合并文件，支持 `.part` 断点续传，并且不需要 OpenRouter Key 或 Codex CLI：
 
 ```bash
-python3 download_youtube.py 'https://www.youtube.com/watch?v=2cTDRKRQ5oc'
+python3 scripts/run_youtube_zh_dub.py \
+  'https://www.youtube.com/watch?v=2cTDRKRQ5oc' --download-only
 ```
 
 默认格式选择器为 `bestvideo` 和 `bestaudio`，不限制分辨率、帧率或源编码，因此会选择 yt-dlp 当前可取得的最清晰视频与最高质量音频。
@@ -67,8 +86,8 @@ python3 download_youtube.py 'https://www.youtube.com/watch?v=2cTDRKRQ5oc'
 可用 `--quality` 将视频清晰度限制为 720p 或 1080p；脚本会选择不超过该高度的最高质量视频流，音频始终选择最高质量：
 
 ```bash
-python3 download_youtube.py URL --quality 720p
-python3 download_youtube.py URL --quality 1080p
+python3 scripts/run_youtube_zh_dub.py URL --download-only --quality 720p
+python3 scripts/run_youtube_zh_dub.py URL --download-only --quality 1080p
 ```
 
 `--quality best` 保持不限制清晰度的默认行为。若同一输出目录已经完成另一种清晰度的下载，请使用新的 `--workdir`；只有明确要覆盖旧资源时才使用 `--force`。
