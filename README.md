@@ -170,29 +170,40 @@ python3 youtube_dub.py --workdir output/full --subtitles-only
 
 ## 断点续传最终视频
 
-转录完成并取得最终视频的真实下载 URL 后，可使用下面的命令下载。
-如果下载中断，重新运行同一条命令即可从已有文件继续；服务端需要支持 HTTP
-Range 请求。
+转录完成后，可以通过 SSH 和 `rsync` 下载最终视频。`SSH_USER`、`SSH_HOST`
+和远程绝对路径必须替换成真实连接信息；客户端与服务器都需要安装 `rsync`，
+并且用户需要具备 SSH 登录权限。如果下载中断，重新运行同一条命令即可续传并
+校验已有内容。
 
 Linux：
 
 ```bash
-curl -fL -C - --retry 5 --retry-delay 2 -o 'dubbed.zh.mp4' 'DOWNLOAD_URL'
+rsync --partial --append-verify --progress -e ssh \
+  'SSH_USER@SSH_HOST:/absolute/path/dubbed.zh.mp4' './dubbed.zh.mp4'
 ```
 
 macOS：
 
 ```bash
-curl -fL -C - --retry 5 --retry-delay 2 -o 'dubbed.zh.mp4' 'DOWNLOAD_URL'
+rsync --partial --append-verify --progress -e ssh \
+  'SSH_USER@SSH_HOST:/absolute/path/dubbed.zh.mp4' './dubbed.zh.mp4'
 ```
 
-Windows PowerShell 或命令提示符：
+Windows PowerShell（需要 WSL，并在 WSL 中安装 `rsync`）：
 
 ```powershell
-curl.exe -fL -C - --retry 5 --retry-delay 2 -o "dubbed.zh.mp4" "DOWNLOAD_URL"
+wsl rsync --partial --append-verify --progress -e ssh `
+  "SSH_USER@SSH_HOST:/absolute/path/dubbed.zh.mp4" `
+  "/mnt/c/Users/WINDOWS_USER/Downloads/dubbed.zh.mp4"
 ```
 
-将 `DOWNLOAD_URL` 替换成最终视频附件或文件服务提供的真实下载地址。本机文件
-路径不是下载 URL；没有可远程访问的 URL 时，不应虚构地址。
+通常的 rsync-over-SSH 下载源是 `USER@HOST:/path`，它不是网页链接。只有服务器
+实际配置了 rsync daemon 和共享模块时，才会存在类似下面的 URL：
+
+```text
+rsync://HOST/MODULE/path/dubbed.zh.mp4
+```
+
+没有真实 SSH 地址或 rsync daemon 配置时，不应虚构连接信息。
 
 MAI-Transcribe 的标准接口不返回词级时间戳。因此原始时间戳精度是“静音感知的片段级”，默认约 15 秒。校对模型只输出有序的完整句子，不生成时间戳；程序依据原始各块的词数密度将句子边界确定性地映射回完整时间轴，中文翻译和配音再严格复用这些边界。

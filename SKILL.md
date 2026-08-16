@@ -83,26 +83,30 @@ After the command succeeds:
 3. Use `ffprobe` to require video, audio, and subtitle streams. Confirm H.264 video, AAC audio, and `mov_text` subtitle codecs.
 4. Decode the full final file with `ffmpeg -v error -i dubbed.zh.mp4 -f null -`; require exit code 0.
 5. Return clickable absolute paths for the final video, Chinese SRT, Chinese JSON audit, and sync report. State the maximum tempo and whether warnings were found.
-6. After successful full-video transcription, also provide resumable download commands for `dubbed.zh.mp4` on all three platforms below. Replace `DOWNLOAD_URL` with the real, remotely reachable URL for the final video when one is available. Never invent a URL or substitute a server-local filesystem path; if the client exposes only a clickable file attachment, keep the placeholder and tell the user to copy that attachment's download URL into the command.
+6. After successful full-video transcription, also provide resumable `rsync` download commands for `dubbed.zh.mp4` on all three platforms below. Prefer a real SSH source in the form `SSH_USER@SSH_HOST:/absolute/path/dubbed.zh.mp4`. Only provide an `rsync://HOST/MODULE/path/dubbed.zh.mp4` URL when an rsync daemon and module are actually configured and reachable. Never invent a hostname, account, module, or public address. If SSH connection details are unavailable, keep the placeholders and state exactly which values the user must replace.
 
    Linux:
 
    ```bash
-   curl -fL -C - --retry 5 --retry-delay 2 -o 'dubbed.zh.mp4' 'DOWNLOAD_URL'
+   rsync --partial --append-verify --progress -e ssh \
+     'SSH_USER@SSH_HOST:/absolute/path/dubbed.zh.mp4' './dubbed.zh.mp4'
    ```
 
    macOS:
 
    ```bash
-   curl -fL -C - --retry 5 --retry-delay 2 -o 'dubbed.zh.mp4' 'DOWNLOAD_URL'
+   rsync --partial --append-verify --progress -e ssh \
+     'SSH_USER@SSH_HOST:/absolute/path/dubbed.zh.mp4' './dubbed.zh.mp4'
    ```
 
-   Windows PowerShell or Command Prompt:
+   Windows PowerShell with WSL and `rsync` installed inside WSL:
 
    ```powershell
-   curl.exe -fL -C - --retry 5 --retry-delay 2 -o "dubbed.zh.mp4" "DOWNLOAD_URL"
+   wsl rsync --partial --append-verify --progress -e ssh `
+     "SSH_USER@SSH_HOST:/absolute/path/dubbed.zh.mp4" `
+     "/mnt/c/Users/WINDOWS_USER/Downloads/dubbed.zh.mp4"
    ```
 
-   Explain briefly that `-C -` resumes from the existing local file, so rerunning the same command continues an interrupted download. The remote server must support HTTP byte-range requests. Do not offer these final-video commands for debug-only or download-only runs that did not produce `dubbed.zh.mp4`.
+   Explain briefly that `--partial` keeps an interrupted local file and `--append-verify` resumes and verifies it when the same command is rerun. State that rsync-over-SSH requires a reachable SSH server, valid account/key access, and `rsync` installed at both ends; Windows additionally requires WSL for the documented command. When a genuine rsync daemon URL is available, also show it separately as `rsync://...`. Do not call an SSH source a web link, and do not offer these final-video commands for debug-only or download-only runs that did not produce `dubbed.zh.mp4`.
 
 If validation fails, diagnose and resume the existing workdir. Do not claim completion until the final file passes these checks.
