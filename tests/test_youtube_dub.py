@@ -158,6 +158,27 @@ class TextBatchingTests(unittest.TestCase):
 
 
 class AudioFilterTests(unittest.TestCase):
+    def test_concat_audio_appends_final_timeline_silence(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / "spoken.wav"
+            source.touch()
+
+            def fake_silence(path, duration):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.touch()
+                self.assertAlmostEqual(duration, 2.5)
+
+            with mock.patch.object(youtube_dub, "make_silence", side_effect=fake_silence), mock.patch.object(
+                youtube_dub, "run"
+            ):
+                youtube_dub.concat_audio(
+                    [source], root / "output.wav", root, final_silence=2.5
+                )
+            listing = (root / "segments" / "concat.txt").read_text()
+            self.assertIn("spoken.wav", listing)
+            self.assertTrue(listing.rstrip().endswith("final_silence.wav'"))
+
     def test_atempo_chain_supports_large_factor(self):
         self.assertEqual(
             youtube_dub.atempo_chain(5.0),
