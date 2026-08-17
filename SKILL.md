@@ -64,6 +64,7 @@ When `--workdir` is omitted, put debug output under `output/<video-title>/_debug
 Use the pipeline defaults unless the user asks otherwise. They enforce these invariants:
 
 - Download video and audio together in one `yt-dlp` task and preserve both original streams.
+- Default yt-dlp to the `web_embedded` YouTube player client; override with `--youtube-player-client` only when a demonstrated video-specific restriction requires it.
 - Retain raw English ASR and absolute word timestamps for audit, then correct repeated/broken cross-chunk grammar and align complete sentences back to real word boundaries.
 - Run independent ASR chunks, TTS sentences, and per-window ffmpeg fitting concurrently while preserving ID order, atomic checkpoints, resumability, and per-segment caches.
 - Run English polishing, topic detection, Chinese translation, and overlong-line shortening through the local authenticated Codex CLI without passing it OpenRouter credentials.

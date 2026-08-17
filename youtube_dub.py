@@ -263,6 +263,14 @@ def yt_dlp_common(args: argparse.Namespace) -> list[str]:
         command.extend(
             ["--js-runtimes", "node", "--remote-components", "ejs:github"]
         )
+    youtube_player_client = getattr(args, "youtube_player_client", "web_embedded")
+    if youtube_player_client:
+        command.extend(
+            [
+                "--extractor-args",
+                f"youtube:player_client={youtube_player_client}",
+            ]
+        )
     if args.cookies_from_browser:
         command.extend(["--cookies-from-browser", args.cookies_from_browser])
     proxy = args.proxy or urllib.request.getproxies().get("https") or urllib.request.getproxies().get("http")
@@ -2422,6 +2430,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--cookies-from-browser",
         help="遇到 YouTube 登录校验时传给 yt-dlp，例如 chrome 或 safari",
+    )
+    parser.add_argument(
+        "--youtube-player-client",
+        default="web_embedded",
+        help="yt-dlp 的 YouTube 播放器客户端；默认 web_embedded 以降低 DASH 403 风险",
     )
     parser.add_argument("--proxy", help="显式代理 URL；默认读取系统代理设置")
     parser.add_argument(

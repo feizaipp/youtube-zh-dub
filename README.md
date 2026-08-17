@@ -62,7 +62,7 @@ codex --version
 
 ## 运行
 
-建议在项目虚拟环境中安装最新版 `yt-dlp`（旧版本经常因 YouTube 接口变化而失效）。检测到 Node.js 时，程序还会启用 yt-dlp 官方的 `ejs:github` 远程组件来解决 YouTube JavaScript 挑战，避免因 `n challenge` 失败导致媒体请求返回 403。下载器使用 256 KiB HTTP 分段，并在速度持续低于 50 KiB/s 时主动重连，以缓解长视频单连接逐渐限速：
+建议在项目虚拟环境中安装最新版 `yt-dlp`（旧版本经常因 YouTube 接口变化而失效）。检测到 Node.js 时，程序还会启用 yt-dlp 官方的 `ejs:github` 远程组件来解决 YouTube JavaScript 挑战，并默认使用 `web_embedded` 播放器客户端，降低匿名 VPS 下载 DASH 流时的 403 风险。可用 `--youtube-player-client` 覆盖。下载器使用 256 KiB HTTP 分段，并在速度持续低于 50 KiB/s 时主动重连，以缓解长视频单连接逐渐限速：
 
 ```bash
 python3 -m venv .venv

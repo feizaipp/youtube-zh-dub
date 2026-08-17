@@ -390,6 +390,19 @@ class DownloadTests(unittest.TestCase):
         self.assertIn("--throttled-rate", command)
         self.assertIn("50K", command)
 
+    def test_web_embedded_player_client_is_forwarded_to_ytdlp(self):
+        args = argparse.Namespace(
+            cookies_from_browser=None,
+            proxy=None,
+            youtube_player_client="web_embedded",
+        )
+        with mock.patch.object(youtube_dub.shutil, "which", return_value=None):
+            command = youtube_dub.yt_dlp_common(args)
+        self.assertEqual(
+            command[command.index("--extractor-args") + 1],
+            "youtube:player_client=web_embedded",
+        )
+
     def test_retained_video_and_audio_get_stable_names(self):
         with tempfile.TemporaryDirectory() as folder:
             workdir = Path(folder)
