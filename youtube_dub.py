@@ -43,7 +43,7 @@ POLISH_BATCH_MAX_CHARACTERS = 9_000
 TRANSLATION_BATCH_MAX_CHARACTERS = 6_000
 TEXT_BACKEND = "codex-cli"
 TEXT_PIPELINE_VERSION = 3
-TIMESTAMP_PIPELINE_VERSION = 1
+TIMESTAMP_PIPELINE_VERSION = 2
 BILIBILI_SUBTITLE_RENDER_VERSION = 2
 STAGES = ("download", "transcribe", "polish", "translate", "synthesize", "mux")
 QUALITY_VIDEO_FORMATS = {
@@ -1020,6 +1020,72 @@ def english_tokens(text: str) -> list[str]:
     ]
 
 
+def repair_collapsed_sentence_windows(
+    aligned: list[Segment],
+    sentence_tokens: Sequence[Sequence[str]],
+    usable_words: Sequence[TimedWord],
+) -> list[Segment]:
+    """Redistribute impossible sentence windows using only real word boundaries."""
+    aligned = list(aligned)
+    minimum_seconds_per_token = 0.08
+    collapsed = {
+        index
+        for index, (segment, tokens) in enumerate(zip(aligned, sentence_tokens))
+        if segment.duration < max(0.12, len(tokens) * minimum_seconds_per_token)
+    }
+    while collapsed:
+        first_index = min(collapsed)
+        last_collapsed = first_index
+        while last_collapsed + 1 in collapsed:
+            last_collapsed += 1
+        repair_end = last_collapsed + 1
+        if repair_end >= len(aligned):
+            raise PipelineError(
+                f"校对句子 {first_index + 1} 起的时间窗塌缩，且缺少可靠的后续词边界"
+            )
+        next_reliable = repair_end + 1
+        while next_reliable < len(aligned) and next_reliable in collapsed:
+            next_reliable += 1
+        window_start = aligned[first_index].start
+        window_end = (
+            aligned[next_reliable].start
+            if next_reliable < len(aligned)
+            else aligned[repair_end].end
+        )
+        window_words = [
+            word
+            for word in usable_words
+            if word.start >= window_start - 0.001 and word.end <= window_end + 0.001
+        ]
+        repair_indexes = list(range(first_index, repair_end + 1))
+        token_counts = [len(sentence_tokens[index]) for index in repair_indexes]
+        if len(window_words) < len(repair_indexes) or sum(token_counts) <= 0:
+            raise PipelineError(
+                f"校对句子 {first_index + 1} 起的时间窗塌缩，Whisper 词边界不足以安全修复"
+            )
+        cursor_word = 0
+        remaining_tokens = sum(token_counts)
+        for offset, (sentence_index, token_count) in enumerate(zip(repair_indexes, token_counts)):
+            remaining_sentences = len(repair_indexes) - offset - 1
+            if remaining_sentences:
+                available = len(window_words) - cursor_word
+                take = round(available * token_count / remaining_tokens)
+                take = max(1, min(take, available - remaining_sentences))
+            else:
+                take = len(window_words) - cursor_word
+            chosen = window_words[cursor_word : cursor_word + take]
+            aligned[sentence_index] = Segment(
+                aligned[sentence_index].id,
+                round(chosen[0].start, 3),
+                round(chosen[-1].end, 3),
+                aligned[sentence_index].text,
+            )
+            cursor_word += take
+            remaining_tokens -= token_count
+        collapsed.difference_update(repair_indexes)
+    return aligned
+
+
 def align_sentences_to_timed_words(
     raw_words: Sequence[TimedWord], sentences: Sequence[str]
 ) -> list[Segment]:
@@ -1095,7 +1161,13 @@ def align_sentences_to_timed_words(
             aligned[index] = Segment(current.id, boundary, current.end, current.text)
         if aligned[index].end <= aligned[index].start:
             raise PipelineError(f"校对句子 {index + 1} 的真实词级时间窗无效")
-    return aligned
+
+    # SequenceMatcher can occasionally anchor a block of heavily rewritten text
+    # to one repeated word.  That produces technically monotonic but impossible
+    # windows (for example, several full sentences squeezed into milliseconds).
+    # Repair only those collapsed runs, and put every new boundary on an actual
+    # Whisper word boundary inside the span ending at the next reliable sentence.
+    return repair_collapsed_sentence_windows(aligned, sentence_tokens, usable_words)
 
 
 def batch_english_for_polish(

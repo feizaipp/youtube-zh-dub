@@ -65,6 +65,29 @@ class TimestampTests(unittest.TestCase):
                 words, ["Completely unrelated replacement sentence."]
             )
 
+    def test_collapsed_rewritten_sentences_are_redistributed_on_word_boundaries(self):
+        words = [
+            youtube_dub.TimedWord(text, float(index), float(index) + 0.5)
+            for index, text in enumerate("one two three four five six seven eight nine ten".split())
+        ]
+        segments = [
+            youtube_dub.Segment(0, 0.0, 0.05, "A rewritten sentence."),
+            youtube_dub.Segment(1, 0.05, 0.1, "Another rewritten sentence."),
+            youtube_dub.Segment(2, 0.1, 4.5, "The following reliable sentence."),
+            youtube_dub.Segment(3, 9.0, 9.5, "Anchor sentence."),
+        ]
+        result = youtube_dub.repair_collapsed_sentence_windows(
+            segments,
+            [youtube_dub.english_tokens(item.text) for item in segments],
+            words,
+        )
+        self.assertTrue(all(item.duration >= 0.5 for item in result))
+        real_starts = {item.start for item in words}
+        real_ends = {item.end for item in words}
+        self.assertTrue(all(item.start in real_starts for item in result))
+        self.assertTrue(all(item.end in real_ends for item in result))
+        self.assertTrue(all(a.end <= b.start for a, b in zip(result, result[1:])))
+
     def test_segment_fingerprint_changes_with_corrected_text(self):
         before = [youtube_dub.Segment(0, 0.0, 1.0, "The big")]
         after = [youtube_dub.Segment(0, 0.0, 1.0, "The biggest mistake.")]
@@ -242,7 +265,7 @@ class ConcurrencyTests(unittest.TestCase):
         ])
         self.assertTrue(document["complete"])
         self.assertEqual(document["workers"], 3)
-        self.assertEqual(document["timestamp_pipeline_version"], 1)
+        self.assertEqual(document["timestamp_pipeline_version"], 2)
         self.assertEqual(len(document["words"]), 6)
         self.assertEqual(document["words"][2]["start"], 10.1)
 
