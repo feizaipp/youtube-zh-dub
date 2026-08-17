@@ -265,7 +265,7 @@ class ConcurrencyTests(unittest.TestCase):
         ])
         self.assertTrue(document["complete"])
         self.assertEqual(document["workers"], 3)
-        self.assertEqual(document["timestamp_pipeline_version"], 2)
+        self.assertEqual(document["timestamp_pipeline_version"], 1)
         self.assertEqual(len(document["words"]), 6)
         self.assertEqual(document["words"][2]["start"], 10.1)
 

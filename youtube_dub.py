@@ -43,7 +43,8 @@ POLISH_BATCH_MAX_CHARACTERS = 9_000
 TRANSLATION_BATCH_MAX_CHARACTERS = 6_000
 TEXT_BACKEND = "codex-cli"
 TEXT_PIPELINE_VERSION = 3
-TIMESTAMP_PIPELINE_VERSION = 2
+TIMESTAMP_PIPELINE_VERSION = 1
+ALIGNMENT_PIPELINE_VERSION = 2
 BILIBILI_SUBTITLE_RENDER_VERSION = 2
 STAGES = ("download", "transcribe", "polish", "translate", "synthesize", "mux")
 QUALITY_VIDEO_FORMATS = {
@@ -1204,6 +1205,7 @@ def polish_transcript(
             "segments": [asdict(item) for item in raw_english],
             "words": [asdict(item) for item in raw_words],
             "timestamp_pipeline_version": TIMESTAMP_PIPELINE_VERSION,
+            "alignment_pipeline_version": ALIGNMENT_PIPELINE_VERSION,
         }
     )
     if output_path.exists() and not args.force:
@@ -1323,6 +1325,7 @@ def polish_transcript(
             "source_fingerprint": source_fingerprint,
             "timestamp_basis": "corrected sentences aligned to whisper-1 word start/end timestamps",
             "timestamp_pipeline_version": TIMESTAMP_PIPELINE_VERSION,
+            "alignment_pipeline_version": ALIGNMENT_PIPELINE_VERSION,
             "text_backend": TEXT_BACKEND,
             "text_pipeline_version": TEXT_PIPELINE_VERSION,
             "model": text_model_name(args),
