@@ -135,6 +135,28 @@ def probe_duration(path: Path) -> float:
         raise PipelineError(f"无法读取媒体时长：{path}") from exc
 
 
+def probe_video_duration(path: Path) -> float:
+    result = run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(path),
+        ],
+        capture=True,
+    )
+    try:
+        return float(result.stdout.strip())
+    except ValueError:
+        return probe_duration(path)
+
+
 def write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -1985,7 +2007,6 @@ def concat_audio(
     workdir: Path,
     *,
     initial_silence: float = 0,
-    final_silence: float = 0,
 ) -> None:
     concat_file = workdir / "segments" / "concat.txt"
     concat_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1994,10 +2015,6 @@ def concat_audio(
         initial_silence_path = workdir / "segments" / "initial_silence.wav"
         make_silence(initial_silence_path, initial_silence)
         timeline_files.insert(0, initial_silence_path)
-    if final_silence > 0.001:
-        final_silence_path = workdir / "segments" / "final_silence.wav"
-        make_silence(final_silence_path, final_silence)
-        timeline_files.append(final_silence_path)
     lines = []
     for path in timeline_files:
         escaped = str(path.resolve()).replace("'", "'\\''")
@@ -2042,7 +2059,7 @@ def synthesize_dub(
             "max_tempo": args.max_tempo,
             "edge_trim_version": 1,
             "adaptive_shortening_version": 2,
-            "timeline_silence_version": 2,
+            "timeline_silence_version": 3,
         }
         return hashlib.sha256(
             json.dumps(settings, ensure_ascii=False, sort_keys=True).encode("utf-8")
@@ -2164,7 +2181,6 @@ def synthesize_dub(
         output,
         workdir,
         initial_silence=max(0.0, working[0].start),
-        final_silence=max(0.0, timeline_duration - working[-1].end),
     )
     write_json(
         report_path,
@@ -2199,7 +2215,7 @@ def mux_video(args: argparse.Namespace, workdir: Path, video: Path, dub: Path) -
         if (
             output.stat().st_mtime >= newest_input
             and math.isclose(
-                probe_duration(output), probe_duration(video), abs_tol=0.1
+                probe_video_duration(output), probe_video_duration(video), abs_tol=0.1
             )
         ):
             log("复用与当前配音和字幕一致的已合成视频")
@@ -2215,7 +2231,7 @@ def mux_video(args: argparse.Namespace, workdir: Path, video: Path, dub: Path) -
         and video.stat().st_mtime <= output.stat().st_mtime
         and probe_video_codec(output) == "h264"
         and math.isclose(
-            probe_duration(output), probe_duration(video), abs_tol=0.1
+            probe_video_duration(output), probe_video_duration(video), abs_tol=0.1
         )
     ):
         video_input = output

@@ -158,7 +158,7 @@ class TextBatchingTests(unittest.TestCase):
 
 
 class AudioFilterTests(unittest.TestCase):
-    def test_concat_audio_appends_final_timeline_silence(self):
+    def test_concat_audio_prepends_initial_timeline_silence(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             source = root / "spoken.wav"
@@ -173,11 +173,12 @@ class AudioFilterTests(unittest.TestCase):
                 youtube_dub, "run"
             ):
                 youtube_dub.concat_audio(
-                    [source], root / "output.wav", root, final_silence=2.5
+                    [source], root / "output.wav", root, initial_silence=2.5
                 )
             listing = (root / "segments" / "concat.txt").read_text()
             self.assertIn("spoken.wav", listing)
-            self.assertTrue(listing.rstrip().endswith("final_silence.wav'"))
+            self.assertTrue(listing.startswith("file '"))
+            self.assertLess(listing.index("initial_silence.wav"), listing.index("spoken.wav"))
 
     def test_atempo_chain_supports_large_factor(self):
         self.assertEqual(
