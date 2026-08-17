@@ -30,21 +30,40 @@ class TimestampTests(unittest.TestCase):
             youtube_dub.write_srt(path, [youtube_dub.Segment(0, 0, 1.5, "你好")])
             self.assertEqual(path.read_text(), "1\n00:00:00,000 --> 00:00:01,500\n你好\n")
 
-    def test_complete_sentences_are_mapped_over_original_timeline(self):
-        raw = [
-            youtube_dub.Segment(0, 0.0, 10.0, "one two three four"),
-            youtube_dub.Segment(1, 10.0, 20.0, "five six seven eight"),
+    def test_corrected_sentences_use_real_word_boundaries_and_keep_silence(self):
+        words = [
+            youtube_dub.TimedWord("one", 1.0, 1.4),
+            youtube_dub.TimedWord("two", 1.5, 1.9),
+            youtube_dub.TimedWord("three", 4.0, 4.5),
+            youtube_dub.TimedWord("four", 4.6, 5.0),
         ]
-        result = youtube_dub.allocate_sentence_timestamps(
-            raw,
-            ["One two.", "Three four five six seven eight."],
+        result = youtube_dub.align_sentences_to_timed_words(
+            words, ["One two.", "Three four."]
         )
-        self.assertEqual(result[0], youtube_dub.Segment(0, 0.0, 5.0, "One two."))
-        self.assertEqual(
-            result[1],
-            youtube_dub.Segment(1, 5.0, 20.0, "Three four five six seven eight."),
+        self.assertEqual(result[0], youtube_dub.Segment(0, 1.0, 1.9, "One two."))
+        self.assertEqual(result[1], youtube_dub.Segment(1, 4.0, 5.0, "Three four."))
+        self.assertEqual(result[1].start - result[0].end, 2.1)
+
+    def test_word_alignment_survives_polish_substitutions(self):
+        words = [
+            youtube_dub.TimedWord("CISP", 10.0, 10.5),
+            youtube_dub.TimedWord("starts", 10.6, 11.0),
+            youtube_dub.TimedWord("now", 11.1, 11.4),
+        ]
+        result = youtube_dub.align_sentences_to_timed_words(
+            words, ["CISSP starts now."]
         )
-        self.assertEqual(result[0].end, result[1].start)
+        self.assertEqual(result, [youtube_dub.Segment(0, 10.0, 11.4, "CISSP starts now.")])
+
+    def test_word_alignment_rejects_unrelated_polish_output(self):
+        words = [
+            youtube_dub.TimedWord("original", 1.0, 1.4),
+            youtube_dub.TimedWord("transcript", 1.5, 2.0),
+        ]
+        with self.assertRaisesRegex(youtube_dub.PipelineError, "差异过大"):
+            youtube_dub.align_sentences_to_timed_words(
+                words, ["Completely unrelated replacement sentence."]
+            )
 
     def test_segment_fingerprint_changes_with_corrected_text(self):
         before = [youtube_dub.Segment(0, 0.0, 1.0, "The big")]
@@ -167,7 +186,8 @@ class ConcurrencyTests(unittest.TestCase):
             url="https://youtu.be/example",
             start_seconds=0.0,
             chunk_seconds=10.0,
-            transcriber_model="test-transcriber",
+            transcriber_model="openai/whisper-1",
+            transcriber_backend="openrouter-whisper1",
             transcribe_workers=3,
         )
         active = 0
@@ -187,7 +207,13 @@ class ConcurrencyTests(unittest.TestCase):
                 maximum_active = max(maximum_active, active)
             try:
                 time.sleep(0.03 - index * 0.005)
-                return {"text": f"Sentence {index}."}
+                return {
+                    "text": f"Sentence {index}.",
+                    "words": [
+                        {"word": "Sentence", "start": 0.1, "end": 0.5},
+                        {"word": str(index), "start": 0.6, "end": 0.8},
+                    ],
+                }
             finally:
                 with lock:
                     active -= 1
@@ -216,6 +242,9 @@ class ConcurrencyTests(unittest.TestCase):
         ])
         self.assertTrue(document["complete"])
         self.assertEqual(document["workers"], 3)
+        self.assertEqual(document["timestamp_pipeline_version"], 1)
+        self.assertEqual(len(document["words"]), 6)
+        self.assertEqual(document["words"][2]["start"], 10.1)
 
     def test_tts_preparation_runs_concurrently(self):
         args = argparse.Namespace(tts_workers=4)
@@ -272,10 +301,12 @@ class ConcurrencyTests(unittest.TestCase):
             _max_tempo,
             *,
             generated_duration=None,
+            output_duration=None,
         ):
             nonlocal active, maximum_active
             index = int(_source.stem.split("-")[1])
             self.assertEqual(generated_duration, 1.0)
+            self.assertEqual(output_duration, 1.0)
             with lock:
                 active += 1
                 maximum_active = max(maximum_active, active)
@@ -299,6 +330,7 @@ class ConcurrencyTests(unittest.TestCase):
                 segments,
                 prepared,
                 Path(folder) / "nested" / "fitted",
+                4.0,
                 on_progress=lambda values: checkpoints.append(
                     [int(item["id"]) for item in values]
                 ),
@@ -408,6 +440,64 @@ class DownloadTests(unittest.TestCase):
             self.assertIn("00:00:00,100 --> 00:00:15,000", result)
             self.assertIn("00:00:15,000 --> 00:00:30,000", result)
 
+    def test_bilibili_output_burns_subtitles_and_copies_audio(self):
+        with tempfile.TemporaryDirectory() as folder:
+            workdir = Path(folder)
+            source = workdir / "dubbed.zh.mp4"
+            subtitle = workdir / "transcript.zh.srt"
+            source.write_bytes(b"video")
+            subtitle.write_text(
+                "1\n00:00:00,000 --> 00:00:01,000\n中文字幕\n",
+                encoding="utf-8",
+            )
+            observed: list[str] = []
+
+            def fake_run(command, **_kwargs):
+                observed.extend(command)
+                Path(command[-1]).write_bytes(b"bilibili")
+                return mock.Mock()
+
+            with mock.patch.object(youtube_dub, "run", side_effect=fake_run):
+                output = youtube_dub.burn_bilibili_subtitles(
+                    workdir, source, subtitle
+                )
+
+            self.assertEqual(output.name, "dubbed.zh.bilibili.mp4")
+            self.assertEqual(output.read_bytes(), b"bilibili")
+            self.assertIn("-vf", observed)
+            self.assertIn("subtitles=filename=", observed[observed.index("-vf") + 1])
+            self.assertEqual(observed[observed.index("-c:a") + 1], "copy")
+            self.assertIn("-sn", observed)
+            self.assertIn("libx264", observed)
+
+    def test_bilibili_output_is_reused_when_inputs_are_unchanged(self):
+        with tempfile.TemporaryDirectory() as folder:
+            workdir = Path(folder)
+            source = workdir / "dubbed.zh.mp4"
+            subtitle = workdir / "transcript.zh.srt"
+            output = workdir / "dubbed.zh.bilibili.mp4"
+            source.write_bytes(b"video")
+            subtitle.write_text("subtitle", encoding="utf-8")
+            output.write_bytes(b"existing")
+            os.utime(output, (output.stat().st_atime, max(source.stat().st_mtime, subtitle.stat().st_mtime) + 1))
+            youtube_dub.write_json(
+                workdir / "segments" / "bilibili_subtitle_render.json",
+                {
+                    "render_version": youtube_dub.BILIBILI_SUBTITLE_RENDER_VERSION,
+                    "source_mtime_ns": source.stat().st_mtime_ns,
+                    "subtitle_mtime_ns": subtitle.stat().st_mtime_ns,
+                    "font": "Noto Sans CJK SC",
+                },
+            )
+
+            with mock.patch.object(youtube_dub, "run") as mocked_run:
+                result = youtube_dub.burn_bilibili_subtitles(
+                    workdir, source, subtitle
+                )
+
+            self.assertEqual(result, output)
+            mocked_run.assert_not_called()
+
 
 class TranslationValidationTests(unittest.TestCase):
     def test_translation_ids_must_match(self):
@@ -425,7 +515,7 @@ class TranslationValidationTests(unittest.TestCase):
 
 
 class CodexTextBackendTests(unittest.TestCase):
-    def test_codex_subprocess_does_not_receive_openrouter_configuration(self):
+    def test_codex_subprocess_does_not_receive_model_api_configuration(self):
         args = argparse.Namespace(text_model=None)
         schema = youtube_dub.segment_translation_schema()
         observed: dict[str, object] = {}
@@ -445,6 +535,7 @@ class CodexTextBackendTests(unittest.TestCase):
             os.environ,
             {
                 "OPENROUTER_API_KEY": "must-not-leak",
+                "OPENAI_API_KEY": "also-must-not-leak",
                 "OPENAI_BASE_URL": "https://openrouter.example/v1",
             },
         ):
@@ -456,6 +547,7 @@ class CodexTextBackendTests(unittest.TestCase):
         self.assertIn("--ignore-user-config", observed["command"])
         environment = observed["environment"]
         self.assertNotIn("OPENROUTER_API_KEY", environment)
+        self.assertNotIn("OPENAI_API_KEY", environment)
         self.assertNotIn("OPENAI_BASE_URL", environment)
 
     def test_polish_uses_codex_backend_without_openrouter(self):
@@ -467,6 +559,12 @@ class CodexTextBackendTests(unittest.TestCase):
         raw = [
             youtube_dub.Segment(
                 0, 0.0, 2.0, "Hello hello world this is a transcript test for today"
+            )
+        ]
+        raw_words = [
+            youtube_dub.TimedWord(word, index * 0.15, index * 0.15 + 0.1)
+            for index, word in enumerate(
+                "Hello hello world this is a transcript test for today".split()
             )
         ]
         result_value = {
@@ -482,7 +580,9 @@ class CodexTextBackendTests(unittest.TestCase):
             "openrouter_request",
             side_effect=AssertionError("text work must not call OpenRouter"),
         ):
-            polished = youtube_dub.polish_transcript(args, Path(folder), raw)
+            polished = youtube_dub.polish_transcript(
+                args, Path(folder), raw, raw_words
+            )
             document = youtube_dub.read_json(Path(folder) / "transcript.en.polished.json")
 
         self.assertEqual(
@@ -497,6 +597,10 @@ class CodexTextBackendTests(unittest.TestCase):
             url="https://youtu.be/example",
         )
         raw = [youtube_dub.Segment(0, 0.0, 2.0, "One two three four five.")]
+        raw_words = [
+            youtube_dub.TimedWord(word, index * 0.3, index * 0.3 + 0.2)
+            for index, word in enumerate("One two three four five".split())
+        ]
         result_value = {
             "sentences": ["One two three four five."],
             "corrections": [],
@@ -509,9 +613,9 @@ class CodexTextBackendTests(unittest.TestCase):
             side_effect=AssertionError("text work must not call OpenRouter"),
         ):
             workdir = Path(folder)
-            youtube_dub.polish_transcript(args, workdir, raw)
+            youtube_dub.polish_transcript(args, workdir, raw, raw_words)
             (workdir / "transcript.en.polished.json").unlink()
-            polished = youtube_dub.polish_transcript(args, workdir, raw)
+            polished = youtube_dub.polish_transcript(args, workdir, raw, raw_words)
             batch_document = youtube_dub.read_json(
                 workdir / "segments" / "english_polished_batches" / "batch_0000.json"
             )

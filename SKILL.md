@@ -10,7 +10,7 @@ Run the verified pipeline through `scripts/run_youtube_zh_dub.py`. Treat the com
 ## Execute
 
 1. Extract exactly one `youtube.com` or `youtu.be` URL from the request. Reject a missing or non-YouTube URL instead of guessing.
-2. Check that `OPENROUTER_API_KEY` exists in the environment for MAI transcription and TTS. Never print it, put it in a command argument, store it in the Skill, or recover it from chat history/plaintext files. If missing, ask the user to set it and stop. Also require an installed and authenticated `codex` command for English polishing, topic detection, Chinese translation, and timing rewrites; those text stages must not call OpenRouter.
+2. Check that `OPENROUTER_API_KEY` exists for `openai/whisper-1` word-timestamp transcription and MAI TTS. Never print it, put it in a command argument, store it in the Skill, or recover it from chat history/plaintext files. If missing, ask the user to set it and stop. Also require an installed and authenticated `codex` command for English polishing, topic detection, Chinese translation, and timing rewrites.
 3. Run from any working directory:
 
    ```bash
@@ -20,7 +20,7 @@ Run the verified pipeline through `scripts/run_youtube_zh_dub.py`. Treat the com
 4. Monitor the long-running command and report meaningful stage changes. Do not leave the user without an update for more than 60 seconds.
 5. On a transient failure, inspect the actual error and rerun the same command so completed stages resume. Do not add `--force` unless the user explicitly requests regeneration or a corrupted cached stage is proven.
 
-For download-only requests, run the same launcher with `--download-only`. This mode preserves both original streams, creates the title-based output directory, supports `.part` resume, and does not require or call OpenRouter. Select a video cap with `--quality 720p` or `--quality 1080p`; omit it or use `--quality best` for unrestricted quality. Always keep `bestaudio`:
+For download-only requests, run the same launcher with `--download-only`. This mode preserves both original streams, creates the title-based output directory, supports `.part` resume, and does not require or call either model API. Select a video cap with `--quality 720p` or `--quality 1080p`; omit it or use `--quality best` for unrestricted quality. Always keep `bestaudio`:
 
 ```bash
 python3 ~/.codex/skills/youtube-zh-dub/scripts/run_youtube_zh_dub.py URL --download-only --quality 1080p
@@ -32,7 +32,7 @@ The launcher defaults to:
 - One output directory named after the YouTube title: `<skill-directory>/output/<video-title>`.
 - A sanitized title that preserves readable Unicode while replacing filesystem-invalid characters. Append the video ID only if another video already occupies the same title.
 - Maximum post-processing speed-up of `1.15x` and up to five translation-shortening attempts.
-- Bounded concurrency: three MAI transcription workers, four MAI TTS workers, and four local ffmpeg fitting workers by default; override with `--transcribe-workers`, `--tts-workers`, and `--fit-workers` when rate limits and local CPU capacity allow.
+- Bounded concurrency: three OpenRouter `openai/whisper-1` transcription workers, four MAI TTS workers, and four local ffmpeg fitting workers by default; override with `--transcribe-workers`, `--tts-workers`, and `--fit-workers` when rate limits and local CPU capacity allow.
 - The bundled verified source pipeline at `<skill-directory>/youtube_dub.py`.
 - The project `.venv/bin` prepended to `PATH` when present.
 
@@ -64,13 +64,16 @@ When `--workdir` is omitted, put debug output under `output/<video-title>/_debug
 Use the pipeline defaults unless the user asks otherwise. They enforce these invariants:
 
 - Download video and audio together in one `yt-dlp` task and preserve both original streams.
-- Retain raw English ASR for audit, then correct repeated/broken cross-chunk grammar and segment on complete sentences.
+- Retain raw English ASR and absolute word timestamps for audit, then correct repeated/broken cross-chunk grammar and align complete sentences back to real word boundaries.
 - Run independent ASR chunks, TTS sentences, and per-window ffmpeg fitting concurrently while preserving ID order, atomic checkpoints, resumability, and per-segment caches.
 - Run English polishing, topic detection, Chinese translation, and overlong-line shortening through the local authenticated Codex CLI without passing it OpenRouter credentials.
 - Preserve the polished English timestamps exactly in the Chinese transcript.
+- Preserve real inter-sentence silence and fail explicitly if word timestamps are absent; never fall back to word-count/duration interpolation.
 - Trim only leading/trailing TTS silence; preserve internal pauses.
 - Shorten only Chinese sentences whose natural speech would exceed the maximum tempo, regenerate only those lines, and never silently fast-forward beyond the cap.
 - Produce H.264/AAC video with an embedded default/forced `mov_text` Chinese subtitle stream compatible with QuickTime.
+- Also produce `dubbed.zh.bilibili.mp4` with Chinese subtitles burned into the H.264 picture so video-platform transcoding cannot discard them; copy the already encoded AAC dub audio without regenerating speech.
+- Use `Noto Sans CJK SC` for burned Chinese subtitles and visually inspect a subtitle-bearing frame; install `fonts-noto-cjk` on Debian/Ubuntu if glyphs render as boxes.
 
 Do not manually edit timestamps or invoke independent download/transcription commands unless repairing a demonstrated pipeline defect.
 
@@ -78,7 +81,7 @@ Do not manually edit timestamps or invoke independent download/transcription com
 
 After the command succeeds:
 
-1. Confirm `video_metadata.json`, `dubbed.zh.mp4`, `transcript.en.polished.json`, `transcript.zh.json`, `transcript.zh.srt`, and `sync_report.json` exist inside `output/<video-title>`.
+1. Confirm `video_metadata.json`, `dubbed.zh.mp4`, `dubbed.zh.bilibili.mp4`, `transcript.en.polished.json`, `transcript.zh.json`, `transcript.zh.srt`, and `sync_report.json` exist inside `output/<video-title>`.
 2. Read `sync_report.json`; require zero warnings and no segment tempo above the configured cap.
 3. Use `ffprobe` to require video, audio, and subtitle streams. Confirm H.264 video, AAC audio, and `mov_text` subtitle codecs.
 4. Decode the full final file with `ffmpeg -v error -i dubbed.zh.mp4 -f null -`; require exit code 0.

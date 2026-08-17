@@ -86,6 +86,11 @@ def needs_codex(args: argparse.Namespace, passthrough: list[str]) -> bool:
     return option_value(passthrough, "--stop-after") != "transcribe"
 
 
+def needs_openrouter(args: argparse.Namespace, passthrough: list[str]) -> bool:
+    """Return whether the run reaches OpenRouter transcription or synthesis."""
+    return not is_download_only(args, passthrough)
+
+
 def safe_directory_name(title: str, video_id: str) -> str:
     normalized = unicodedata.normalize("NFKC", title)
     normalized = re.sub(r'[<>:"/\\|?*\x00-\x1f\x7f]', "-", normalized)
@@ -277,9 +282,9 @@ def main() -> int:
         parser.error(str(exc))
 
     download_only = is_download_only(args, passthrough)
-    if not args.dry_run and not download_only and not environment.get("OPENROUTER_API_KEY"):
+    if not args.dry_run and needs_openrouter(args, passthrough) and not environment.get("OPENROUTER_API_KEY"):
         print(
-            "错误：请先通过环境变量 OPENROUTER_API_KEY 提供 OpenRouter API Key。",
+            "错误：请先通过环境变量 OPENROUTER_API_KEY 提供 OpenRouter API Key（用于 whisper-1 转录和中文语音合成）。",
             file=sys.stderr,
         )
         return 2

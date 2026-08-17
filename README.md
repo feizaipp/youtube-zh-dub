@@ -9,12 +9,13 @@
 
 - Python 3.10 或更高版本；
 - `ffmpeg`（同时提供 `ffprobe`）；
+- 生成哔哩哔哩硬字幕版需要中文字体，Ubuntu/Debian 推荐安装 `fonts-noto-cjk`；
 - 完整配音需要已安装并登录的 Codex CLI；
-- 完整配音需要通过环境变量提供 `OPENROUTER_API_KEY`；
+- 完整配音需要通过环境变量提供 `OPENROUTER_API_KEY`（OpenAI whisper-1 词级转录和中文 TTS）；
 - 推荐安装 Node.js，供 `yt-dlp` 处理 YouTube JavaScript 校验。
 
 纯下载模式只需要 Python、`yt-dlp`、`ffmpeg` 和 `ffprobe`，不需要
-OpenRouter Key 或 Codex CLI。
+任何模型 Key 或 Codex CLI。
 
 ```bash
 git clone https://github.com/feizaipp/youtube-zh-dub.git \
@@ -22,6 +23,7 @@ git clone https://github.com/feizaipp/youtube-zh-dub.git \
 cd ~/.codex/skills/youtube-zh-dub
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
+sudo apt-get install fonts-noto-cjk
 ```
 
 安装后重新启动 Codex，使其重新扫描本地 Skills。可先执行不联网的检查：
@@ -34,17 +36,17 @@ python3 -m venv .venv
 这个命令行工具完成以下流程：
 
 1. 用一次 `yt-dlp` 任务同时下载最佳纯视频流和最佳纯音频流，并保留两个原始文件；
-2. 在本地按静音点切分音频，用有界线程池并发调用 OpenRouter 的 MAI-Transcribe 1.5 转成英文；
-3. 通过本机 Codex CLI 跨越原始切块检查英文语法和 ASR 重复词，再按完整句子重新分段并映射回原时间轴；
+2. 在本地按静音点切分音频，通过 OpenRouter 的专用转录端点并发调用 `openai/whisper-1`，取得每个英文词的真实起止时间并换算成全片绝对时间；
+3. 通过本机 Codex CLI 跨越原始切块检查英文语法和 ASR 重复词，再把完整句子按词序对齐回真实词级时间轴；句间原始停顿会被保留；
 4. 通过本机 Codex CLI 识别主题，以领域专家口吻翻译为简体中文，并锁定校对后句子的时间戳；
 5. 用有界线程池并发调用 MAI-Voice-2 生成逐句普通话配音，裁掉模型附带的首尾静音并测量真实讲话时长；
-6. 超过舒适语速上限的句子会由本机 Codex CLI 自动精简并重新生成，最后用 `ffmpeg` 轻微调速、补静音、替换视频音轨并加入中文字幕。
+6. 超过舒适语速上限的句子会由本机 Codex CLI 自动精简并重新生成，最后用 `ffmpeg` 轻微调速、补静音、替换视频音轨；同时输出带可开关软字幕的通用版，以及把中文字幕烧录进画面的哔哩哔哩上传版。
 
 ## 安全设置
 
-英文校对、主题识别、简体中文翻译和超时译文精简不调用 OpenRouter，而是使用本机已登录的 `codex` 命令。Codex 子进程在独立临时目录中以只读模式运行，并且不会继承 `OPENROUTER_API_KEY` 或 API Base URL 覆盖项。
+英文校对、主题识别、简体中文翻译和超时译文精简使用本机已登录的 `codex` 命令。Codex 子进程在独立临时目录中以只读模式运行，并且不会继承模型 API Key 或 API Base URL 覆盖项。
 
-OpenRouter 只用于 MAI 英文转录和 MAI 中文语音合成。不要把 API Key 写进源码或命令行，请通过环境变量提供：
+OpenRouter 用于调用 `openai/whisper-1` 英文词级转录和 MAI 中文语音合成。不要把 API Key 写进源码或命令行，请通过环境变量提供：
 
 ```bash
 export OPENROUTER_API_KEY='你的新 Key'
@@ -121,7 +123,7 @@ python3 youtube_dub.py URL --full --workdir output/full \
 python3 youtube_dub.py URL --text-model MODEL_NAME
 ```
 
-英文转录默认使用 3 个并发线程，中文 TTS 和逐句 ffmpeg 对齐默认各使用 4 个。超长视频可按 OpenRouter 限流和本机 CPU 情况调整，允许范围均为 `1`–`16`：
+英文转录默认使用 3 个并发线程，中文 TTS 和逐句 ffmpeg 对齐默认各使用 4 个。超长视频可分别按 OpenAI/OpenRouter 限流和本机 CPU 情况调整，允许范围均为 `1`–`16`：
 
 ```bash
 python3 youtube_dub.py URL --full --workdir output/full \
@@ -136,7 +138,7 @@ python3 youtube_dub.py URL --full --workdir output/full \
 python3 youtube_dub.py URL --cookies-from-browser chrome
 ```
 
-各阶段可恢复；超长英文稿会尽量在完整句边界分批校对，中文翻译使用较小批次，并把每个成功批次单独缓存。若中途失败，重跑时会按输入文本、完整请求、Codex 模型、文本后端及管线版本安全复用已经完成的批次，旧的 OpenRouter 文本结果不会被当成 Codex 结果继续复用。未完成的 yt-dlp `.part` 文件也会断点续传。只有显式使用 `--force` 才会覆盖下载断点和重跑产物；`--stop-after transcribe` 可只调试到原始英文转录，`--stop-after polish` 可停在语法校对和完整句重分段之后。
+各阶段可恢复；whisper-1 的词级结果按后端、模型和时间轴版本校验后缓存，旧的片段级缓存不会被误用。超长英文稿会尽量在完整句边界分批校对，中文翻译使用较小批次，并把每个成功批次单独缓存。若中途失败，重跑会安全复用兼容的已完成批次。未完成的 yt-dlp `.part` 文件也会断点续传。只有显式使用 `--force` 才会覆盖下载断点和重跑产物；`--stop-after transcribe` 可只调试到原始英文转录，`--stop-after polish` 可停在语法校对和完整句重分段之后。
 
 若只需重建最终视频（例如修复播放器兼容性），无需重新调用模型：
 
@@ -161,12 +163,13 @@ python3 youtube_dub.py --workdir output/full --subtitles-only
 - `source_video_original.*`：yt-dlp 下载并保留的纯视频流；
 - `source_audio_original.*`：yt-dlp 下载并保留的纯音频流；
 - `source_audio.wav`：由上述原始音频转换得到的单声道 16 kHz 转录音频；
-- `transcript.en.json` / `.srt`：MAI 返回的原始切块英文稿，保留用于审计；
+- `transcript.en.json` / `.srt`：whisper-1 返回的原始切块英文稿；JSON 同时保留带绝对起止时间的词数组，供审计和恢复；
 - `transcript.en.polished.json` / `.srt`：跨切块纠错并按完整句子重分段后的英文稿，JSON 同时记录重要修订；
 - `transcript.zh.json` / `.srt`：与校对后英文句子保持相同时间戳的中文稿及主题；JSON 还记录为控制语速进行的逐句精简历史；
 - `chinese_voice.wav`：对齐后的中文音轨；
 - `sync_report.json`：每段裁剪后自然语音时长、目标时长、最终调速倍率和本轮自动精简记录；
 - `dubbed.zh.mp4`：最终中文配音视频。
+- `dubbed.zh.bilibili.mp4`：中文字幕已烧录进画面的 H.264/AAC 成片，适合直接上传哔哩哔哩；字幕始终可见，不依赖平台识别 MP4 内挂字幕轨。
 
 ## 断点续传最终视频
 
@@ -206,4 +209,4 @@ rsync://HOST/MODULE/path/dubbed.zh.mp4
 
 没有真实 SSH 地址或 rsync daemon 配置时，不应虚构连接信息。
 
-MAI-Transcribe 的标准接口不返回词级时间戳。因此原始时间戳精度是“静音感知的片段级”，默认约 15 秒。校对模型只输出有序的完整句子，不生成时间戳；程序依据原始各块的词数密度将句子边界确定性地映射回完整时间轴，中文翻译和配音再严格复用这些边界。
+时间轴以 whisper-1 返回的真实词级起止时间为依据。每个切块的相对词时间会加上切块起点，换算为全片绝对时间；校对模型只修改文本，不生成时间戳，程序通过词序对齐把校对后的完整句子映射回这些真实边界，并保留句间静音。若接口没有返回词级时间戳，管线会明确失败，不会退回按字数或片段时长估算，以免再次产生音画错位。

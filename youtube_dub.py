@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import difflib
 import hashlib
 import http.client
 import json
@@ -30,7 +31,8 @@ from typing import Any, Callable, Iterable, Sequence
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_URL = "https://www.youtube.com/watch?v=2cTDRKRQ5oc"
-DEFAULT_TRANSCRIBER = "microsoft/mai-transcribe-1.5"
+DEFAULT_TRANSCRIBER = "openai/whisper-1"
+DEFAULT_TRANSCRIBER_BACKEND = "openrouter-whisper1"
 DEFAULT_TTS = "microsoft/mai-voice-2"
 DEFAULT_VOICE = "zh-CN-Mei:MAI-Voice-2"
 DEFAULT_TRANSCRIBE_WORKERS = 3
@@ -40,7 +42,9 @@ MAX_NETWORK_WORKERS = 16
 POLISH_BATCH_MAX_CHARACTERS = 9_000
 TRANSLATION_BATCH_MAX_CHARACTERS = 6_000
 TEXT_BACKEND = "codex-cli"
-TEXT_PIPELINE_VERSION = 2
+TEXT_PIPELINE_VERSION = 3
+TIMESTAMP_PIPELINE_VERSION = 1
+BILIBILI_SUBTITLE_RENDER_VERSION = 2
 STAGES = ("download", "transcribe", "polish", "translate", "synthesize", "mux")
 QUALITY_VIDEO_FORMATS = {
     "best": "bestvideo",
@@ -63,6 +67,13 @@ class Segment:
     @property
     def duration(self) -> float:
         return self.end - self.start
+
+
+@dataclass(frozen=True)
+class TimedWord:
+    text: str
+    start: float
+    end: float
 
 
 def log(message: str) -> None:
@@ -147,6 +158,18 @@ def parse_segments(document: dict[str, Any], language_key: str = "text") -> list
             )
         )
     return segments
+
+
+def parse_words(document: dict[str, Any]) -> list[TimedWord]:
+    words: list[TimedWord] = []
+    for item in document.get("words", []):
+        text = str(item.get("text", item.get("word", ""))).strip()
+        start = float(item["start"])
+        end = float(item["end"])
+        if not text or end <= start:
+            continue
+        words.append(TimedWord(text=text, start=start, end=end))
+    return words
 
 
 def seconds_to_srt(value: float) -> str:
@@ -321,6 +344,11 @@ def prepare_quicktime_subtitle(source: Path, destination: Path) -> Path:
     if replacements:
         log("QuickTime 字幕启动修复：首条字幕延后 100 毫秒")
     return destination
+
+
+def escape_subtitle_filter_path(path: Path) -> str:
+    """Escape a path for ffmpeg's subtitles filter (not for a shell)."""
+    return str(path.resolve()).replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
 
 
 def find_standardized_stream(workdir: Path, prefix: str, kind: str) -> Path | None:
@@ -609,7 +637,7 @@ def transcribe_segment(
     start: float,
     end: float,
     api_key: str,
-) -> Segment:
+) -> tuple[Segment, list[TimedWord]]:
     """Extract and transcribe one independent ASR segment."""
     chunk = segment_dir / f"segment_{index:04d}.wav"
     extract_segment(audio, chunk, start, end)
@@ -622,13 +650,27 @@ def transcribe_segment(
             "input_audio": {"data": encoded, "format": "wav"},
             "language": "en",
             "temperature": 0,
+            "response_format": "verbose_json",
+            "timestamp_granularities": ["word"],
         },
+        timeout_seconds=75,
     )
     assert isinstance(response, dict)
     text = str(response.get("text", "")).strip()
     if not text:
         raise PipelineError(f"转录模型没有为片段 {index} 返回文本")
-    return Segment(index, start, end, text)
+    words = []
+    for item in response.get("words", []):
+        word = str(item.get("word", item.get("text", ""))).strip()
+        word_start = start + float(item["start"])
+        word_end = start + float(item["end"])
+        if word and word_end > word_start:
+            words.append(TimedWord(word, round(word_start, 3), round(word_end, 3)))
+    if not words:
+        raise PipelineError(
+            f"片段 {index} 没有词级时间戳；禁止退回按字数估算时间轴"
+        )
+    return Segment(index, start, end, text), words
 
 
 def transcribe_audio(
@@ -636,14 +678,33 @@ def transcribe_audio(
 ) -> list[Segment]:
     transcript_path = workdir / "transcript.en.json"
     cached_by_id: dict[int, Segment] = {}
+    cached_words_by_chunk: dict[int, list[TimedWord]] = {}
     if transcript_path.exists() and not args.force:
         cached_document = read_json(transcript_path)
         cached_segments = parse_segments(cached_document)
-        if cached_document.get("complete"):
+        cached_words = parse_words(cached_document)
+        compatible_cache = (
+            cached_document.get("timestamp_pipeline_version") == TIMESTAMP_PIPELINE_VERSION
+            and cached_document.get("backend") == args.transcriber_backend
+            and cached_document.get("model") == args.transcriber_model
+        )
+        if (
+            cached_document.get("complete")
+            and compatible_cache
+            and cached_words
+        ):
             log("复用英文转录")
             return cached_segments
-        cached_by_id = {item.id: item for item in cached_segments}
-        log(f"发现未完成的英文转录，将从 {len(cached_segments)} 个已完成片段继续")
+        if compatible_cache:
+            cached_by_id = {item.id: item for item in cached_segments}
+            for item in cached_document.get("words", []):
+                chunk_id = int(item.get("chunk_id", -1))
+                parsed = parse_words({"words": [item]})
+                if parsed and chunk_id >= 0:
+                    cached_words_by_chunk.setdefault(chunk_id, []).extend(parsed)
+            log(f"发现未完成的词级英文转录，将从 {len(cached_segments)} 个已完成片段继续")
+        else:
+            log("旧英文转录不含兼容词级时间轴，将重新转录")
 
     duration = probe_duration(audio)
     silences = detect_silence_midpoints(audio)
@@ -651,6 +712,7 @@ def transcribe_audio(
     segment_dir = workdir / "segments" / "english"
     total_segments = len(boundaries) - 1
     completed_by_id: dict[int, Segment] = {}
+    completed_words_by_id: dict[int, list[TimedWord]] = {}
     pending: list[tuple[int, float, float]] = []
     for index, (start, end) in enumerate(zip(boundaries, boundaries[1:])):
         cached = cached_by_id.get(index)
@@ -659,14 +721,22 @@ def transcribe_audio(
             and math.isclose(cached.start, start, abs_tol=0.01)
             and math.isclose(cached.end, end, abs_tol=0.01)
             and cached.text
+            and cached_words_by_chunk.get(index)
         ):
             log(f"复用转录片段 {index + 1}/{total_segments}")
             completed_by_id[index] = cached
+            completed_words_by_id[index] = cached_words_by_chunk[index]
             continue
         pending.append((index, start, end))
 
     def write_checkpoint() -> None:
-        ordered = [completed_by_id[index] for index in sorted(completed_by_id)]
+        ordered_ids = sorted(completed_by_id)
+        ordered = [completed_by_id[index] for index in ordered_ids]
+        ordered_words = [
+            {**asdict(word), "chunk_id": index}
+            for index in ordered_ids
+            for word in completed_words_by_id[index]
+        ]
         write_json(
             transcript_path,
             {
@@ -674,20 +744,23 @@ def transcribe_audio(
                 "source_start_seconds": args.start_seconds,
                 "duration": duration,
                 "timestamp_basis": "seconds relative to source.mp4",
-                "timestamp_method": "local silence-aware audio segmentation",
+                "timestamp_method": "OpenRouter openai/whisper-1 word timestamps with absolute chunk offsets",
+                "timestamp_pipeline_version": TIMESTAMP_PIPELINE_VERSION,
+                "backend": args.transcriber_backend,
                 "model": args.transcriber_model,
                 "workers": args.transcribe_workers,
                 "segments": [asdict(item) for item in ordered],
+                "words": ordered_words,
                 "complete": len(ordered) == total_segments,
             },
         )
 
     if pending:
-        api_key = require_openrouter_api_key("MAI 英文转录")
+        api_key = require_openrouter_api_key("OpenAI whisper-1 英文转录")
         worker_count = min(args.transcribe_workers, len(pending))
         log(f"并发转录 {len(pending)} 个片段（{worker_count} 个线程）")
         failures: list[tuple[int, Exception]] = []
-        futures: dict[Future[Segment], int] = {}
+        futures: dict[Future[tuple[Segment, list[TimedWord]]], int] = {}
         with ThreadPoolExecutor(
             max_workers=worker_count, thread_name_prefix="youtube-dub-asr"
         ) as executor:
@@ -706,12 +779,13 @@ def transcribe_audio(
             for future in as_completed(futures):
                 index = futures[future]
                 try:
-                    segment = future.result()
+                    segment, words = future.result()
                 except Exception as exc:  # Preserve other successful checkpoints.
                     failures.append((index, exc))
                     log(f"转录片段 {index + 1}/{total_segments} 失败：{exc}")
                     continue
                 completed_by_id[index] = segment
+                completed_words_by_id[index] = words
                 log(
                     f"转录完成 {len(completed_by_id)}/{total_segments}："
                     f"片段 {index + 1} [{segment.start:.2f}, {segment.end:.2f}]"
@@ -805,6 +879,7 @@ def codex_json_completion(
         # environment override that could redirect the OpenAI client there.
         for name in (
             "OPENROUTER_API_KEY",
+            "OPENAI_API_KEY",
             "OPENAI_BASE_URL",
             "OPENAI_API_BASE",
             "OPENAI_API_HOST",
@@ -930,44 +1005,89 @@ def english_word_count(text: str) -> int:
     return len(re.findall(r"[A-Za-z0-9]+(?:[+'’-][A-Za-z0-9]+)*", text))
 
 
-def allocate_sentence_timestamps(
-    raw_segments: Sequence[Segment], sentences: Sequence[str]
-) -> list[Segment]:
-    """Map corrected sentences onto the original chunk timeline by word density."""
-    if not raw_segments or not sentences:
-        raise PipelineError("无法为空转录分配句子时间戳")
-    raw_counts = [max(1, english_word_count(item.text)) for item in raw_segments]
-    sentence_counts = [max(1, english_word_count(text)) for text in sentences]
-    total_raw = sum(raw_counts)
-    total_corrected = sum(sentence_counts)
-
-    raw_cumulative = [0]
-    for count in raw_counts:
-        raw_cumulative.append(raw_cumulative[-1] + count)
-
-    def raw_position_to_time(position: float) -> float:
-        for index, segment in enumerate(raw_segments):
-            left = raw_cumulative[index]
-            right = raw_cumulative[index + 1]
-            if position <= right or index == len(raw_segments) - 1:
-                fraction = min(1.0, max(0.0, (position - left) / (right - left)))
-                return segment.start + fraction * segment.duration
-        return raw_segments[-1].end
-
-    corrected_cumulative = [0]
-    for count in sentence_counts:
-        corrected_cumulative.append(corrected_cumulative[-1] + count)
-    boundaries = [
-        raw_position_to_time(position / total_corrected * total_raw)
-        for position in corrected_cumulative
-    ]
-    boundaries[0] = raw_segments[0].start
-    boundaries[-1] = raw_segments[-1].end
-    rounded = [round(value, 3) for value in boundaries]
+def english_tokens(text: str) -> list[str]:
     return [
-        Segment(index, rounded[index], rounded[index + 1], text.strip())
-        for index, text in enumerate(sentences)
+        token.replace("’", "'").lower()
+        for token in re.findall(r"[A-Za-z0-9]+(?:[+'’-][A-Za-z0-9]+)*", text)
     ]
+
+
+def align_sentences_to_timed_words(
+    raw_words: Sequence[TimedWord], sentences: Sequence[str]
+) -> list[Segment]:
+    """Align corrected sentences to ASR words without inventing a continuous timeline."""
+    if not raw_words or not sentences:
+        raise PipelineError("词级时间轴或校对句子为空，无法进行强制词序对齐")
+    raw_tokens = [english_tokens(word.text)[0] for word in raw_words if english_tokens(word.text)]
+    usable_words = [word for word in raw_words if english_tokens(word.text)]
+    sentence_tokens = [english_tokens(sentence) for sentence in sentences]
+    if not raw_tokens or any(not tokens for tokens in sentence_tokens):
+        raise PipelineError("词级时间轴或校对句子不含可对齐的英文单词")
+    corrected_tokens = [token for tokens in sentence_tokens for token in tokens]
+    mapping: list[int | None] = [None] * len(corrected_tokens)
+    matcher = difflib.SequenceMatcher(None, raw_tokens, corrected_tokens, autojunk=False)
+    if matcher.ratio() < 0.65:
+        raise PipelineError(
+            "校对文本与原始 ASR 差异过大，无法可靠映射到真实词级时间轴；"
+            "请检查校对结果，禁止使用估算时间戳继续"
+        )
+    for tag, raw_start, raw_end, corrected_start, corrected_end in matcher.get_opcodes():
+        corrected_size = corrected_end - corrected_start
+        raw_size = raw_end - raw_start
+        if tag == "delete" or not corrected_size:
+            continue
+        if tag == "equal":
+            for offset in range(corrected_size):
+                mapping[corrected_start + offset] = raw_start + offset
+        elif raw_size:
+            for offset in range(corrected_size):
+                position = min(raw_size - 1, int(offset * raw_size / corrected_size))
+                mapping[corrected_start + offset] = raw_start + position
+        else:
+            anchor = min(len(usable_words) - 1, max(0, raw_start - 1))
+            for offset in range(corrected_size):
+                mapping[corrected_start + offset] = anchor
+    last = 0
+    for index, value in enumerate(mapping):
+        if value is None:
+            mapping[index] = last
+        else:
+            last = value
+    last = len(usable_words) - 1
+    for index in range(len(mapping) - 1, -1, -1):
+        value = mapping[index]
+        if value is None:
+            mapping[index] = last
+        else:
+            last = value
+
+    aligned: list[Segment] = []
+    cursor = 0
+    for sentence_id, (sentence, tokens) in enumerate(zip(sentences, sentence_tokens)):
+        indexes = [int(value) for value in mapping[cursor : cursor + len(tokens)] if value is not None]
+        cursor += len(tokens)
+        if not indexes:
+            raise PipelineError(f"校对句子 {sentence_id + 1} 无法映射到原音频单词")
+        first = usable_words[min(indexes)]
+        last_word = usable_words[max(indexes)]
+        aligned.append(
+            Segment(sentence_id, round(first.start, 3), round(last_word.end, 3), sentence.strip())
+        )
+
+    # Corrections can map two neighboring sentences onto the same ASR word. Split only
+    # such overlaps; preserve genuine inter-sentence silence exactly as returned by ASR.
+    for index in range(1, len(aligned)):
+        previous = aligned[index - 1]
+        current = aligned[index]
+        if previous.end > current.start:
+            boundary = round((max(previous.start, current.start) + min(previous.end, current.end)) / 2, 3)
+            aligned[index - 1] = Segment(
+                previous.id, previous.start, boundary, previous.text
+            )
+            aligned[index] = Segment(current.id, boundary, current.end, current.text)
+        if aligned[index].end <= aligned[index].start:
+            raise PipelineError(f"校对句子 {index + 1} 的真实词级时间窗无效")
+    return aligned
 
 
 def batch_english_for_polish(
@@ -996,9 +1116,16 @@ def polish_transcript(
     args: argparse.Namespace,
     workdir: Path,
     raw_english: Sequence[Segment],
+    raw_words: Sequence[TimedWord],
 ) -> list[Segment]:
     output_path = workdir / "transcript.en.polished.json"
-    source_fingerprint = segments_fingerprint(raw_english)
+    source_fingerprint = json_fingerprint(
+        {
+            "segments": [asdict(item) for item in raw_english],
+            "words": [asdict(item) for item in raw_words],
+            "timestamp_pipeline_version": TIMESTAMP_PIPELINE_VERSION,
+        }
+    )
     if output_path.exists() and not args.force:
         cached = read_json(output_path)
         if (
@@ -1100,28 +1227,29 @@ def polish_transcript(
     if incomplete:
         raise PipelineError(f"英文校对结果仍含不完整句子：{incomplete[0]}")
 
-    raw_words = sum(english_word_count(item.text) for item in raw_english)
-    corrected_words = sum(english_word_count(text) for text in sentences)
-    ratio = corrected_words / max(1, raw_words)
+    raw_word_count = sum(english_word_count(item.text) for item in raw_english)
+    corrected_word_count = sum(english_word_count(text) for text in sentences)
+    ratio = corrected_word_count / max(1, raw_word_count)
     if not 0.85 <= ratio <= 1.15:
         raise PipelineError(
-            f"英文校对前后词数变化异常（{raw_words} -> {corrected_words}，比例 {ratio:.2f}）"
+            f"英文校对前后词数变化异常（{raw_word_count} -> {corrected_word_count}，比例 {ratio:.2f}）"
         )
 
-    polished = allocate_sentence_timestamps(raw_english, sentences)
+    polished = align_sentences_to_timed_words(raw_words, sentences)
     write_json(
         output_path,
         {
             "source_url": args.url,
             "source_fingerprint": source_fingerprint,
-            "timestamp_basis": "sentence boundaries allocated over the original ASR chunk timeline",
+            "timestamp_basis": "corrected sentences aligned to whisper-1 word start/end timestamps",
+            "timestamp_pipeline_version": TIMESTAMP_PIPELINE_VERSION,
             "text_backend": TEXT_BACKEND,
             "text_pipeline_version": TEXT_PIPELINE_VERSION,
             "model": text_model_name(args),
             "grammar_check": True,
             "complete_sentences": True,
-            "word_count_before": raw_words,
-            "word_count_after": corrected_words,
+            "word_count_before": raw_word_count,
+            "word_count_after": corrected_word_count,
             "corrections": corrections,
             "segments": [asdict(item) for item in polished],
             "complete": True,
@@ -1632,6 +1760,7 @@ def fit_audio_to_window(
     max_tempo: float,
     *,
     generated_duration: float | None = None,
+    output_duration: float | None = None,
 ) -> dict[str, Any]:
     if generated_duration is None:
         generated_duration = probe_duration(source)
@@ -1641,13 +1770,17 @@ def fit_audio_to_window(
         raise PipelineError(
             f"配音仍需 {tempo:.3f}x 加速，超过 {max_tempo:.3f}x 上限；请继续压缩译文"
         )
+    if output_duration is None:
+        output_duration = target_duration
+    if output_duration + 0.001 < target_duration:
+        raise PipelineError("配音输出窗口不能短于真实句子时间窗")
     filter_parts = []
     if tempo > 1.002:
         filter_parts.append(atempo_chain(tempo))
     filter_parts.extend(
         [
-            f"apad=whole_dur={target_duration:.6f}",
-            f"atrim=duration={target_duration:.6f}",
+            f"apad=whole_dur={output_duration:.6f}",
+            f"atrim=duration={output_duration:.6f}",
             "asetpts=PTS-STARTPTS",
         ]
     )
@@ -1678,6 +1811,7 @@ def fit_audio_to_window(
     return {
         "generated_duration": round(generated_duration, 3),
         "target_duration": round(target_duration, 3),
+        "output_duration": round(output_duration, 3),
         "tempo": round(tempo, 4),
         "warning": None,
     }
@@ -1688,6 +1822,7 @@ def fit_audio_segments(
     segments: Sequence[Segment],
     prepared: dict[int, tuple[Path, float, str]],
     fitted_dir: Path,
+    timeline_duration: float,
     *,
     on_progress: Callable[[list[dict[str, Any]]], None] | None = None,
 ) -> tuple[list[Path], list[dict[str, Any]]]:
@@ -1703,8 +1838,14 @@ def fit_audio_segments(
     with ThreadPoolExecutor(
         max_workers=worker_count, thread_name_prefix="youtube-dub-fit"
     ) as executor:
-        for segment in segments:
+        for position, segment in enumerate(segments):
             source, generated_duration, segment_cache_key = prepared[segment.id]
+            next_start = (
+                segments[position + 1].start
+                if position + 1 < len(segments)
+                else timeline_duration
+            )
+            output_duration = max(segment.duration, next_start - segment.start)
             fitted = fitted_dir / (
                 f"segment_{segment.id:04d}_{segment_cache_key}_"
                 f"tempo_{args.max_tempo:.3f}.wav"
@@ -1716,6 +1857,7 @@ def fit_audio_segments(
                 segment.duration,
                 args.max_tempo,
                 generated_duration=generated_duration,
+                output_duration=output_duration,
             )
             futures[future] = (segment, fitted)
         for completed, future in enumerate(as_completed(futures), 1):
@@ -1754,11 +1896,18 @@ def fit_audio_segments(
     return fitted_files, reports
 
 
-def concat_audio(files: Sequence[Path], destination: Path, workdir: Path) -> None:
+def concat_audio(
+    files: Sequence[Path], destination: Path, workdir: Path, *, initial_silence: float = 0
+) -> None:
     concat_file = workdir / "segments" / "concat.txt"
     concat_file.parent.mkdir(parents=True, exist_ok=True)
+    timeline_files = list(files)
+    if initial_silence > 0.001:
+        initial_silence_path = workdir / "segments" / "initial_silence.wav"
+        make_silence(initial_silence_path, initial_silence)
+        timeline_files.insert(0, initial_silence_path)
     lines = []
-    for path in files:
+    for path in timeline_files:
         escaped = str(path.resolve()).replace("'", "'\\''")
         lines.append(f"file '{escaped}'")
     concat_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -1801,6 +1950,7 @@ def synthesize_dub(
             "max_tempo": args.max_tempo,
             "edge_trim_version": 1,
             "adaptive_shortening_version": 2,
+            "timeline_silence_version": 1,
         }
         return hashlib.sha256(
             json.dumps(settings, ensure_ascii=False, sort_keys=True).encode("utf-8")
@@ -1905,17 +2055,24 @@ def synthesize_dub(
             },
         )
 
+    timeline_duration = probe_duration(workdir / "source.mp4")
     fitted_files, reports = fit_audio_segments(
         args,
         working,
         prepared,
         fitted_dir,
+        timeline_duration,
         on_progress=write_fit_checkpoint,
     )
 
     if not fitted_files:
         raise PipelineError("没有可合成的中文片段")
-    concat_audio(fitted_files, output, workdir)
+    concat_audio(
+        fitted_files,
+        output,
+        workdir,
+        initial_silence=max(0.0, working[0].start),
+    )
     write_json(
         report_path,
         {
@@ -1946,8 +2103,15 @@ def mux_video(args: argparse.Namespace, workdir: Path, video: Path, dub: Path) -
         if subtitle_source.exists():
             input_paths.append(subtitle_source)
         newest_input = max(path.stat().st_mtime for path in input_paths)
-        if output.stat().st_mtime >= newest_input:
+        if (
+            output.stat().st_mtime >= newest_input
+            and math.isclose(
+                probe_duration(output), probe_duration(video), abs_tol=0.1
+            )
+        ):
             log("复用与当前配音和字幕一致的已合成视频")
+            if subtitle_source.exists():
+                burn_bilibili_subtitles(workdir, output, subtitle_source)
             return output
 
     # If only the dub/subtitles changed, reuse the already encoded H.264 video
@@ -1957,6 +2121,9 @@ def mux_video(args: argparse.Namespace, workdir: Path, video: Path, dub: Path) -
         output.exists()
         and video.stat().st_mtime <= output.stat().st_mtime
         and probe_video_codec(output) == "h264"
+        and math.isclose(
+            probe_duration(output), probe_duration(video), abs_tol=0.1
+        )
     ):
         video_input = output
         log("复用现有最终文件中的 H.264 视频轨，仅更新配音和字幕")
@@ -2047,6 +2214,85 @@ def mux_video(args: argparse.Namespace, workdir: Path, video: Path, dub: Path) -
     ])
     run(command)
     temporary_output.replace(output)
+    if subtitle_source.exists():
+        burn_bilibili_subtitles(workdir, output, subtitle_source)
+    return output
+
+
+def burn_bilibili_subtitles(
+    workdir: Path, source_video: Path, subtitle_source: Path
+) -> Path:
+    """Create an upload-safe MP4 with Chinese subtitles rendered into pixels."""
+    output = workdir / "dubbed.zh.bilibili.mp4"
+    metadata_path = workdir / "segments" / "bilibili_subtitle_render.json"
+    newest_input = max(source_video.stat().st_mtime, subtitle_source.stat().st_mtime)
+    render_metadata = read_json(metadata_path) if metadata_path.exists() else {}
+    if (
+        output.exists()
+        and output.stat().st_mtime >= newest_input
+        and render_metadata.get("render_version") == BILIBILI_SUBTITLE_RENDER_VERSION
+        and render_metadata.get("source_mtime_ns") == source_video.stat().st_mtime_ns
+        and render_metadata.get("subtitle_mtime_ns") == subtitle_source.stat().st_mtime_ns
+    ):
+        log("复用与当前成片和字幕一致的哔哩哔哩硬字幕版")
+        return output
+
+    temporary_output = workdir / "dubbed.zh.bilibili.tmp.mp4"
+    subtitle_filter = (
+        f"subtitles=filename='{escape_subtitle_filter_path(subtitle_source)}':"
+        "force_style='FontName=Noto Sans CJK SC,Alignment=2,MarginV=28,Outline=2,Shadow=0'"
+    )
+    log("烧录中文字幕，生成哔哩哔哩上传版（视频需要重新编码，音频直接复制）")
+    run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-progress",
+            "pipe:1",
+            "-stats_period",
+            "10",
+            "-nostats",
+            "-y",
+            "-i",
+            str(source_video),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0",
+            "-vf",
+            subtitle_filter,
+            "-c:v",
+            "libx264",
+            "-preset",
+            "medium",
+            "-crf",
+            "20",
+            "-pix_fmt",
+            "yuv420p",
+            "-tag:v",
+            "avc1",
+            "-c:a",
+            "copy",
+            "-sn",
+            "-map_metadata",
+            "0",
+            "-movflags",
+            "+faststart",
+            str(temporary_output),
+        ]
+    )
+    temporary_output.replace(output)
+    write_json(
+        metadata_path,
+        {
+            "render_version": BILIBILI_SUBTITLE_RENDER_VERSION,
+            "source_mtime_ns": source_video.stat().st_mtime_ns,
+            "subtitle_mtime_ns": subtitle_source.stat().st_mtime_ns,
+            "font": "Noto Sans CJK SC",
+        },
+    )
     return output
 
 
@@ -2125,6 +2371,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--chunk-seconds", type=float, default=15.0, help="目标转录片段时长")
     parser.add_argument("--transcriber-model", default=DEFAULT_TRANSCRIBER)
+    parser.add_argument(
+        "--transcriber-backend",
+        choices=("openrouter-whisper1",),
+        default=DEFAULT_TRANSCRIBER_BACKEND,
+        help="英文转录后端；默认通过 OpenRouter 调用 OpenAI whisper-1 词级时间戳",
+    )
     parser.add_argument(
         "--transcribe-workers",
         type=int,
@@ -2214,6 +2466,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise PipelineError("--start-seconds 不能小于 0")
     if args.chunk_seconds < 4:
         raise PipelineError("--chunk-seconds 不能小于 4")
+    if args.transcriber_model != "openai/whisper-1":
+        raise PipelineError(
+            "openrouter-whisper1 后端必须使用 --transcriber-model openai/whisper-1"
+        )
     if not 1 <= args.transcribe_workers <= MAX_NETWORK_WORKERS:
         raise PipelineError(
             f"--transcribe-workers 必须在 1 到 {MAX_NETWORK_WORKERS} 之间"
@@ -2249,6 +2505,7 @@ def ensure_manifest(args: argparse.Namespace, workdir: Path) -> None:
             )
     write_json(manifest_path, {"input": mode, "models": {
         "transcriber": args.transcriber_model,
+        "transcriber_backend": args.transcriber_backend,
         "text_backend": TEXT_BACKEND,
         "text": text_model_name(args),
         "tts": args.tts_model,
@@ -2271,7 +2528,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.subtitles_only:
             log("仅加入字幕模式：复制现有音视频轨，不调用模型")
             output = embed_subtitles_only(workdir)
+            bilibili_output = burn_bilibili_subtitles(
+                workdir, output, workdir / "transcript.zh.srt"
+            )
             log(f"中文字幕已加入：{output}")
+            log(f"哔哩哔哩硬字幕版：{bilibili_output}")
             return 0
 
         if args.remux_only:
@@ -2282,6 +2543,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise PipelineError("--remux-only 需要已有的 source.mp4 和 chinese_voice.wav")
             output = mux_video(args, workdir, video, dub)
             log(f"重新封装完成：{output}")
+            if (workdir / "transcript.zh.srt").exists():
+                log(f"哔哩哔哩硬字幕版：{workdir / 'dubbed.zh.bilibili.mp4'}")
             return 0
 
         ensure_manifest(args, workdir)
@@ -2298,7 +2561,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         raw_english = transcribe_audio(args, workdir, source_audio)
         if args.stop_after == "transcribe":
             return 0
-        english = polish_transcript(args, workdir, raw_english)
+        transcript_document = read_json(workdir / "transcript.en.json")
+        english = polish_transcript(
+            args, workdir, raw_english, parse_words(transcript_document)
+        )
         if args.stop_after == "polish":
             return 0
         chinese = translate_segments(args, workdir, english)
@@ -2309,6 +2575,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         output = mux_video(args, workdir, video, dub)
         log(f"完成：{output}")
+        log(f"哔哩哔哩硬字幕版：{workdir / 'dubbed.zh.bilibili.mp4'}")
         return 0
     except (PipelineError, OSError, ValueError) as exc:
         print(f"错误：{exc}", file=sys.stderr)

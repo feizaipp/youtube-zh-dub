@@ -48,6 +48,25 @@ class SkillLauncherTests(unittest.TestCase):
         args = argparse.Namespace(download_only=False)
         self.assertTrue(launcher.needs_codex(args, []))
 
+    def test_download_only_requires_no_model_keys(self):
+        args = argparse.Namespace(download_only=True)
+        self.assertFalse(launcher.needs_openrouter(args, []))
+
+    def test_transcribe_only_requires_openrouter(self):
+        args = argparse.Namespace(download_only=False)
+        passthrough = ["--stop-after", "transcribe"]
+        self.assertTrue(launcher.needs_openrouter(args, passthrough))
+
+    def test_translate_only_requires_openrouter_for_transcription(self):
+        args = argparse.Namespace(download_only=False)
+        self.assertTrue(
+            launcher.needs_openrouter(args, ["--stop-after", "translate"])
+        )
+
+    def test_full_pipeline_requires_openrouter(self):
+        args = argparse.Namespace(download_only=False)
+        self.assertTrue(launcher.needs_openrouter(args, []))
+
 
 if __name__ == "__main__":
     unittest.main()
