@@ -6,6 +6,7 @@ description: Download selectable-quality YouTube streams, or turn an English You
 # YouTube 中文配音
 
 Run the verified pipeline through `scripts/run_youtube_zh_dub.py`. Treat the command “转录 <YouTube Link>” as a request for the complete Chinese-dubbed video, not only a text transcript.
+Set `SKILL_DIR` to this Skill package's root before using the examples below.
 
 ## Execute
 
@@ -14,20 +15,22 @@ section in `README.md` before running the workflow. It defines the required sepa
 Skill/CosyVoice environments, a low-memory smoke test, and the exact resume rule.
 
 1. Extract exactly one `youtube.com` or `youtu.be` URL from the request. Reject a missing or non-YouTube URL instead of guessing.
-2. The defaults are local `faster-whisper medium.en` transcription (CPU INT8) and local `Fun-CosyVoice3-0.5B` source-voice TTS. Neither needs an API key. Require `OPENROUTER_API_KEY` only when `--tts-backend mai` or `--transcriber-backend openrouter-whisper1` is explicitly selected. Never expose or recover the key from plaintext. Also require an authenticated `codex` command for English polishing, topic detection, Chinese translation, and timing rewrites.
+2. The defaults are local `faster-whisper medium.en` transcription (CPU INT8) and local `Fun-CosyVoice3-0.5B` source-voice TTS. Neither needs an API key. Require `OPENROUTER_API_KEY` only when `--tts-backend mai` or `--transcriber-backend openrouter-whisper1` is explicitly selected. Never expose or recover the key from plaintext. English polishing, topic detection, Chinese translation, and timing rewrites are completed by the Agent currently running this Skill, using its own configured backend model; they do not invoke a separate model CLI.
 3. Run from any working directory:
 
    ```bash
-   python3 ~/.codex/skills/youtube-zh-dub/scripts/run_youtube_zh_dub.py 'YOUTUBE_URL'
+   python3 "$SKILL_DIR/scripts/run_youtube_zh_dub.py" 'YOUTUBE_URL'
    ```
 
 4. Monitor the long-running command and report meaningful stage changes. Do not leave the user without an update for more than 60 seconds.
 5. On a transient failure, inspect the actual error and rerun the same command so completed stages resume. Do not add `--force` unless the user explicitly requests regeneration or a corrupted cached stage is proven.
 
+When the pipeline reports an Agent text request, follow [the agent text-exchange protocol](references/agent-text-backend.md): use the current backend model to produce the required JSON response, save it at the requested path, and rerun the unchanged command. This is the portable text backend for Codex, OpenClaw, Hermes, and other Skill hosts.
+
 For download-only requests, run the same launcher with `--download-only`. This mode preserves both original streams, creates the title-based output directory, supports `.part` resume, and does not require or call either model API. Select a video cap with `--quality 720p` or `--quality 1080p`; omit it or use `--quality best` for unrestricted quality. Always keep `bestaudio`:
 
 ```bash
-python3 ~/.codex/skills/youtube-zh-dub/scripts/run_youtube_zh_dub.py URL --download-only --quality 1080p
+python3 "$SKILL_DIR/scripts/run_youtube_zh_dub.py" URL --download-only --quality 1080p
 ```
 
 The launcher defaults to:
@@ -46,10 +49,10 @@ Pass supported pipeline options after the URL. Examples:
 
 ```bash
 # Use Chrome cookies only when the user authorizes it or YouTube requires login.
-python3 ~/.codex/skills/youtube-zh-dub/scripts/run_youtube_zh_dub.py URL --cookies-from-browser chrome
+python3 "$SKILL_DIR/scripts/run_youtube_zh_dub.py" URL --cookies-from-browser chrome
 
 # Explicit alternate output directory.
-python3 ~/.codex/skills/youtube-zh-dub/scripts/run_youtube_zh_dub.py URL --workdir /absolute/output/path
+python3 "$SKILL_DIR/scripts/run_youtube_zh_dub.py" URL --workdir /absolute/output/path
 ```
 
 The local TTS backend discovers `COSYVOICE_ROOT`, `COSYVOICE_PYTHON`, and `COSYVOICE_MODEL`, or accepts the matching `--cosyvoice-root`, `--cosyvoice-python`, and `--cosyvoice-model` options. The default layout is a sibling `cosyvoice/` checkout, `miniconda-cosyvoice/bin/python`, and `cosyvoice/pretrained_models/Fun-CosyVoice3-0.5B`. Use `--tts-backend mai` when local CosyVoice is unavailable or the user explicitly prefers the hosted voice.
@@ -63,7 +66,7 @@ The production pipeline has already been validated. Run the full workflow direct
 When diagnosing code, model, download, or environment changes, process only 30–45 seconds first:
 
 ```bash
-python3 ~/.codex/skills/youtube-zh-dub/scripts/run_youtube_zh_dub.py URL --debug-seconds 45 --workdir /absolute/debug/path
+python3 "$SKILL_DIR/scripts/run_youtube_zh_dub.py" URL --debug-seconds 45 --workdir /absolute/debug/path
 ```
 
 Keep debug and full-run directories separate. Stop at the earliest relevant stage with `--stop-after` when possible. Never spend model tokens on a full-video diagnostic run.
@@ -78,7 +81,7 @@ Use the pipeline defaults unless the user asks otherwise. They enforce these inv
 - Retain raw English ASR and absolute word timestamps for audit, then correct repeated/broken cross-chunk grammar and align complete sentences back to real word boundaries.
 - Run independent ASR chunks, TTS sentences, and per-window ffmpeg fitting concurrently while preserving ID order, atomic checkpoints, resumability, and per-segment caches.
 - Load the local Whisper model once per run and retain its real word timestamps. The first run may download `medium.en`; subsequent runs reuse the local model cache.
-- Run English polishing, topic detection, Chinese translation, and overlong-line shortening through the local authenticated Codex CLI without passing it OpenRouter credentials.
+- Complete English polishing, topic detection, Chinese translation, and overlong-line shortening through the calling Agent's current backend model, using the structured request/response files when the pipeline reaches a text stage.
 - Preserve the polished English timestamps exactly in the Chinese transcript.
 - Preserve real inter-sentence silence and fail explicitly if word timestamps are absent; never fall back to word-count/duration interpolation.
 - Trim only leading/trailing TTS silence; preserve internal pauses.

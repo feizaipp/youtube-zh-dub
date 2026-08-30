@@ -802,43 +802,41 @@ class TranslationValidationTests(unittest.TestCase):
         self.assertEqual(value, {"segments": [{"id": 1, "zh": "你好。"}]})
 
 
-class CodexTextBackendTests(unittest.TestCase):
-    def test_codex_subprocess_does_not_receive_model_api_configuration(self):
+class CallingAgentTextBackendTests(unittest.TestCase):
+    def test_pipeline_does_not_require_a_vendor_model_cli(self):
+        requested: list[str] = []
+
+        def find_tool(name: str) -> str:
+            requested.append(name)
+            return f"/usr/bin/{name}"
+
+        with mock.patch.object(youtube_dub.shutil, "which", side_effect=find_tool):
+            youtube_dub.require_tools(argparse.Namespace())
+
+        self.assertEqual(requested, ["yt-dlp", "ffmpeg", "ffprobe"])
+
+    def test_agent_request_is_resumable_and_checks_its_fingerprint(self):
         args = argparse.Namespace(text_model=None)
         schema = youtube_dub.segment_translation_schema()
-        observed: dict[str, object] = {}
-
-        def fake_run(command, **kwargs):
-            observed["command"] = command
-            observed["environment"] = kwargs["env"]
-            output_index = command.index("--output-last-message") + 1
-            Path(command[output_index]).write_text(
-                '{"segments":[{"id":0,"zh":"你好。"}]}', encoding="utf-8"
+        with tempfile.TemporaryDirectory() as folder:
+            workdir = Path(folder)
+            with self.assertRaisesRegex(youtube_dub.PipelineError, "当前后端模型"):
+                youtube_dub.agent_json_completion(args, workdir, "Translate.", "Hello.", schema)
+            request_path = next((workdir / "segments" / "agent_text_requests").glob("*.request.json"))
+            request = youtube_dub.read_json(request_path)
+            response_path = Path(request["response_path"])
+            youtube_dub.write_json(
+                response_path,
+                {
+                    "request_fingerprint": request["request_fingerprint"],
+                    "result": {"segments": [{"id": 0, "zh": "你好。"}]},
+                },
             )
-            return mock.Mock(stdout="", stderr="")
-
-        with mock.patch.object(youtube_dub.shutil, "which", return_value="/usr/bin/codex"), mock.patch.object(
-            youtube_dub.subprocess, "run", side_effect=fake_run
-        ), mock.patch.dict(
-            os.environ,
-            {
-                "OPENROUTER_API_KEY": "must-not-leak",
-                "OPENAI_API_KEY": "also-must-not-leak",
-                "OPENAI_BASE_URL": "https://openrouter.example/v1",
-            },
-        ):
-            result = youtube_dub.codex_json_completion(
-                args, "Translate.", "Hello.", schema
-            )
+            result = youtube_dub.agent_json_completion(args, workdir, "Translate.", "Hello.", schema)
 
         self.assertEqual(result["segments"][0]["zh"], "你好。")
-        self.assertIn("--ignore-user-config", observed["command"])
-        environment = observed["environment"]
-        self.assertNotIn("OPENROUTER_API_KEY", environment)
-        self.assertNotIn("OPENAI_API_KEY", environment)
-        self.assertNotIn("OPENAI_BASE_URL", environment)
 
-    def test_polish_uses_codex_backend_without_openrouter(self):
+    def test_polish_uses_calling_agent_backend_without_openrouter(self):
         args = argparse.Namespace(
             force=True,
             text_model=None,
@@ -862,7 +860,7 @@ class CodexTextBackendTests(unittest.TestCase):
             ],
         }
         with tempfile.TemporaryDirectory() as folder, mock.patch.object(
-            youtube_dub, "codex_json_completion", return_value=result_value
+            youtube_dub, "agent_json_completion", return_value=result_value
         ), mock.patch.object(
             youtube_dub,
             "openrouter_request",
@@ -876,7 +874,7 @@ class CodexTextBackendTests(unittest.TestCase):
         self.assertEqual(
             polished[0].text, "Hello world this is a transcript test for today."
         )
-        self.assertEqual(document["text_backend"], "codex-cli")
+        self.assertEqual(document["text_backend"], "calling-agent")
 
     def test_polish_resumes_from_per_batch_cache(self):
         args = argparse.Namespace(
@@ -894,7 +892,7 @@ class CodexTextBackendTests(unittest.TestCase):
             "corrections": [],
         }
         with tempfile.TemporaryDirectory() as folder, mock.patch.object(
-            youtube_dub, "codex_json_completion", return_value=result_value
+            youtube_dub, "agent_json_completion", return_value=result_value
         ) as completion, mock.patch.object(
             youtube_dub,
             "openrouter_request",
@@ -910,10 +908,10 @@ class CodexTextBackendTests(unittest.TestCase):
 
         self.assertEqual(completion.call_count, 1)
         self.assertEqual(polished[0].text, "One two three four five.")
-        self.assertEqual(batch_document["text_backend"], "codex-cli")
+        self.assertEqual(batch_document["text_backend"], "calling-agent")
         self.assertIn("request_fingerprint", batch_document)
 
-    def test_translation_uses_codex_backend_without_openrouter(self):
+    def test_translation_uses_calling_agent_backend_without_openrouter(self):
         args = argparse.Namespace(
             force=True,
             text_model=None,
@@ -930,7 +928,7 @@ class CodexTextBackendTests(unittest.TestCase):
             "segments": [{"id": 0, "zh": "大家好。"}],
         }
         with tempfile.TemporaryDirectory() as folder, mock.patch.object(
-            youtube_dub, "codex_json_completion", return_value=result_value
+            youtube_dub, "agent_json_completion", return_value=result_value
         ), mock.patch.object(
             youtube_dub,
             "openrouter_request",
@@ -940,7 +938,7 @@ class CodexTextBackendTests(unittest.TestCase):
             document = youtube_dub.read_json(Path(folder) / "transcript.zh.json")
 
         self.assertEqual(translated[0].text, "大家好。")
-        self.assertEqual(document["text_backend"], "codex-cli")
+        self.assertEqual(document["text_backend"], "calling-agent")
 
     def test_translation_resumes_all_batches_and_accepts_ellipsis(self):
         args = argparse.Namespace(
@@ -965,7 +963,7 @@ class CodexTextBackendTests(unittest.TestCase):
             {"segments": [{"id": 1, "zh": "第二段…"}]},
         ]
         with tempfile.TemporaryDirectory() as folder, mock.patch.object(
-            youtube_dub, "codex_json_completion", side_effect=results
+            youtube_dub, "agent_json_completion", side_effect=results
         ) as completion, mock.patch.object(
             youtube_dub,
             "openrouter_request",
@@ -979,12 +977,12 @@ class CodexTextBackendTests(unittest.TestCase):
         self.assertEqual(completion.call_count, 2)
         self.assertEqual([item.text for item in translated], ["第一段……", "第二段…"])
 
-    def test_timing_shortening_uses_codex_backend_without_openrouter(self):
+    def test_timing_shortening_uses_calling_agent_backend_without_openrouter(self):
         args = argparse.Namespace(text_model=None, max_tempo=1.15)
         segments = [youtube_dub.Segment(0, 0.0, 2.0, "这是一句很长的中文。")]
         result_value = {"segments": [{"id": 0, "zh": "这句话很长。"}]}
         with tempfile.TemporaryDirectory() as folder, mock.patch.object(
-            youtube_dub, "codex_json_completion", return_value=result_value
+            youtube_dub, "agent_json_completion", return_value=result_value
         ), mock.patch.object(
             youtube_dub,
             "openrouter_request",
@@ -1006,7 +1004,7 @@ class CodexTextBackendTests(unittest.TestCase):
         segments = [youtube_dub.Segment(0, 0.0, 2.0, "这是一句很长的中文。")]
         result_value = {"segments": [{"id": 0, "zh": "长话短说……"}]}
         with tempfile.TemporaryDirectory() as folder, mock.patch.object(
-            youtube_dub, "codex_json_completion", return_value=result_value
+            youtube_dub, "agent_json_completion", return_value=result_value
         ):
             rewritten, _ = youtube_dub.shorten_translations_for_timing(
                 args,

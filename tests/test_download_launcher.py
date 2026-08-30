@@ -32,22 +32,6 @@ class SkillLauncherTests(unittest.TestCase):
             launcher.is_download_only(args, ["--stop-after", "download"])
         )
 
-    def test_download_only_does_not_require_codex(self):
-        args = argparse.Namespace(download_only=True)
-        self.assertFalse(launcher.needs_codex(args, []))
-
-    def test_download_stop_stage_does_not_require_codex(self):
-        args = argparse.Namespace(download_only=False)
-        self.assertFalse(launcher.needs_codex(args, ["--stop-after", "download"]))
-
-    def test_transcribe_stop_stage_does_not_require_codex(self):
-        args = argparse.Namespace(download_only=False)
-        self.assertFalse(launcher.needs_codex(args, ["--stop-after", "transcribe"]))
-
-    def test_full_pipeline_requires_codex(self):
-        args = argparse.Namespace(download_only=False)
-        self.assertTrue(launcher.needs_codex(args, []))
-
     def test_download_only_requires_no_model_keys(self):
         args = argparse.Namespace(download_only=True)
         self.assertFalse(launcher.needs_openrouter(args, []))

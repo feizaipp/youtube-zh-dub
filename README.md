@@ -1,7 +1,7 @@
 # YouTube 英译中配音管线
 
-本仓库同时是可安装的 Codex Skill 与独立命令行项目。将仓库克隆到
-`~/.codex/skills/youtube-zh-dub` 后，即可通过 `$youtube-zh-dub` 调用；
+本仓库同时是可安装的 Agent Skill 与独立命令行项目。将仓库安装到宿主 Agent 的
+Skill 目录后即可调用；
 `SKILL.md`、`agents/` 和 `scripts/` 构成 Skill 包，根目录的 Python 文件是
 其自带的处理流水线。
 
@@ -10,7 +10,7 @@
 - Python 3.10 或更高版本；
 - `ffmpeg`（同时提供 `ffprobe`）；
 - 生成哔哩哔哩硬字幕版需要中文字体，Ubuntu/Debian 推荐安装 `fonts-noto-cjk`；
-- 完整配音需要已安装并登录的 Codex CLI；
+- 完整配音需要调用 Skill 的 Agent 能使用其当前配置的后端模型完成结构化文本任务；
 - 英文词级转录默认在本地运行 `faster-whisper medium.en`（CPU INT8），无需转录 API 费用；
 - 默认中文配音使用本地 Fun-CosyVoice3-0.5B，并要求可用的 CosyVoice 源码、模型和独立 Python 环境；
 - 默认使用本地 Demucs `htdemucs` 分离英文人声并保留背景音乐；首次使用会下载模型权重；
@@ -18,7 +18,7 @@
 - 推荐安装 Node.js，供 `yt-dlp` 处理 YouTube JavaScript 校验。
 
 纯下载模式只需要 Python、`yt-dlp`、`ffmpeg` 和 `ffprobe`，不需要
-任何模型 Key 或 Codex CLI。
+任何模型 Key 或额外的模型 CLI。
 
 ## 给其他 Agent 的快速部署
 
@@ -30,9 +30,9 @@ Python 环境或模型。
 sudo apt-get update
 sudo apt-get install -y ffmpeg fonts-noto-cjk git python3-venv
 
-git clone https://github.com/feizaipp/youtube-zh-dub.git \
-  ~/.codex/skills/youtube-zh-dub
-cd ~/.codex/skills/youtube-zh-dub
+git clone https://github.com/feizaipp/youtube-zh-dub.git /opt/skills/youtube-zh-dub
+export SKILL_DIR=/opt/skills/youtube-zh-dub
+cd "$SKILL_DIR"
 python3 -m venv .venv
 .venv/bin/python -m pip install -U pip
 # CPU 主机先安装 PyTorch CPU 构建，避免 pip 下载无用的 CUDA 运行库。
@@ -49,14 +49,15 @@ modelscope download --model FunAudioLLM/Fun-CosyVoice3-0.5B \
 ```
 
 `conda` 和 `modelscope` 不在基础系统中时，应先按 CosyVoice 官方文档安装；
-不要把 CosyVoice 包安装进 Skill 的 `.venv`。运行完整工作流还需安装并登录
-Codex CLI：`codex --version` 应能成功执行。YouTube 的 JavaScript 校验通常还
-需要 Node.js；若下载报缺少 JS runtime，应先安装 Node.js，再重试同一命令。
+不要把 CosyVoice 包安装进 Skill 的 `.venv`。完整工作流会把英文校对、主题识别、
+中文翻译和超时精简交给调用 Skill 的 Agent 当前后端模型；具体的文件交换方式见
+[`references/agent-text-backend.md`](references/agent-text-backend.md)。YouTube 的 JavaScript
+校验通常还需要 Node.js；若下载报缺少 JS runtime，应先安装 Node.js，再重试同一命令。
 
 先做不下载模型的静态检查：
 
 ```bash
-cd ~/.codex/skills/youtube-zh-dub
+cd "$SKILL_DIR"
 .venv/bin/python -m py_compile youtube_dub.py scripts/run_youtube_zh_dub.py
 .venv/bin/python scripts/run_youtube_zh_dub.py \
   'https://youtu.be/dQw4w9WgXcQ' --download-only --dry-run --video-title smoke-test
@@ -81,9 +82,9 @@ PATH="$PWD/.venv/bin:$PATH" python3 scripts/run_youtube_zh_dub.py URL \
 翻译和已完成的句子音频。不要加 `--force`，除非明确需要丢弃缓存重做。
 
 ```bash
-git clone https://github.com/feizaipp/youtube-zh-dub.git \
-  ~/.codex/skills/youtube-zh-dub
-cd ~/.codex/skills/youtube-zh-dub
+git clone https://github.com/feizaipp/youtube-zh-dub.git /opt/skills/youtube-zh-dub
+export SKILL_DIR=/opt/skills/youtube-zh-dub
+cd "$SKILL_DIR"
 python3 -m venv .venv
 .venv/bin/python -m pip install torch \
   --index-url https://download.pytorch.org/whl/cpu
@@ -91,7 +92,7 @@ python3 -m venv .venv
 sudo apt-get install fonts-noto-cjk
 ```
 
-安装后重新启动 Codex，使其重新扫描本地 Skills。可先执行不联网的检查：
+安装后重新启动或刷新宿主 Agent，使其重新扫描本地 Skills。可先执行不联网的检查：
 
 ```bash
 .venv/bin/python scripts/run_youtube_zh_dub.py \
@@ -102,14 +103,14 @@ sudo apt-get install fonts-noto-cjk
 
 1. 用一次 `yt-dlp` 任务同时下载最佳纯视频流和最佳纯音频流，并保留两个原始文件；
 2. 在本地按静音点切分音频，使用共享的 `faster-whisper medium.en` 模型取得每个英文词的真实起止时间并换算成全片绝对时间；
-3. 通过本机 Codex CLI 跨越原始切块检查英文语法和 ASR 重复词，再把完整句子按词序对齐回真实词级时间轴；句间原始停顿会被保留；
-4. 通过本机 Codex CLI 识别主题，以领域专家口吻翻译为简体中文，并锁定校对后句子的时间戳；
+3. 由调用 Skill 的 Agent 当前后端模型跨越原始切块检查英文语法和 ASR 重复词，再把完整句子按词序对齐回真实词级时间轴；句间原始停顿会被保留；
+4. 由同一 Agent 后端模型识别主题，以领域专家口吻翻译为简体中文，并锁定校对后句子的时间戳；
 5. 默认从每个英文句子的原始时间窗提取参考语音，用单实例 Fun-CosyVoice3 跨语言克隆当前说话人的音色并顺序生成中文；也可选择 MAI-Voice-2；
-6. 超过舒适语速上限的句子会由本机 Codex CLI 自动精简并重新生成；Demucs 从高质量原始音频中移除英文人声，`ffmpeg` 在中文说话时自动压低背景声并与中文配音混合；最后同时输出带可开关软字幕的通用版，以及把中文字幕烧录进画面的哔哩哔哩上传版。
+6. 超过舒适语速上限的句子会由同一 Agent 后端模型精简并重新生成；Demucs 从高质量原始音频中移除英文人声，`ffmpeg` 在中文说话时自动压低背景声并与中文配音混合；最后同时输出带可开关软字幕的通用版，以及把中文字幕烧录进画面的哔哩哔哩上传版。
 
 ## 安全设置
 
-英文校对、主题识别、简体中文翻译和超时译文精简使用本机已登录的 `codex` 命令。Codex 子进程在独立临时目录中以只读模式运行，并且不会继承模型 API Key 或 API Base URL 覆盖项。
+英文校对、主题识别、简体中文翻译和超时译文精简使用调用 Skill 的 Agent 当前后端模型。管线会生成带 JSON Schema 的文件请求；Agent 完成请求后写入同目录的响应文件并重跑原命令。该交换协议不依赖任何特定 Agent 或模型 CLI，详见 [`references/agent-text-backend.md`](references/agent-text-backend.md)。
 
 OpenRouter 只在显式选择 MAI 中文语音合成或 `openrouter-whisper1` 时使用。不要把 API Key 写进源码或命令行，请通过环境变量提供：
 
@@ -118,12 +119,6 @@ export OPENROUTER_API_KEY='你的新 Key'
 ```
 
 如果 Key 曾经出现在聊天记录、终端历史或普通文本文件中，应在 OpenRouter 控制台撤销并重新创建。
-
-运行前确认 Codex CLI 已安装并登录：
-
-```bash
-codex --version
-```
 
 ## 运行
 
@@ -156,7 +151,7 @@ python3 youtube_dub.py URL --full \
 
 每个中文句子会使用同一时间窗的英文原声作为参考，因此多说话人视频无需预先标注角色。模型始终只加载一份并逐句生成，以控制内存。若要改回托管音色，使用 `--tts-backend mai`。
 
-只需一键下载最高质量的独立视频流和独立音频流时，使用 Skill 启动器。它会自动创建 `output/<视频标题>/`，保留原始视频、原始音频和合并文件，支持 `.part` 断点续传，并且不需要 OpenRouter Key 或 Codex CLI：
+只需一键下载最高质量的独立视频流和独立音频流时，使用 Skill 启动器。它会自动创建 `output/<视频标题>/`，保留原始视频、原始音频和合并文件，支持 `.part` 断点续传，并且不需要 OpenRouter Key 或 Agent 文本任务：
 
 ```bash
 python3 scripts/run_youtube_zh_dub.py \
@@ -188,7 +183,7 @@ python3 youtube_dub.py URL --debug-seconds 30 --start-seconds 60 --workdir outpu
 python3 youtube_dub.py URL --full --workdir output/full
 ```
 
-为避免中文配音出现“快进感”，后期加速默认严格限制为 `1.15x`。自然语音超过这个上限时，程序只把超时句子交给 Codex CLI 精简，并重新生成这些句子的 TTS；不会重新转录视频。可按需要调整：
+为避免中文配音出现“快进感”，后期加速默认严格限制为 `1.15x`。自然语音超过这个上限时，程序只将超时句子交给调用 Skill 的 Agent 当前后端模型精简，并重新生成这些句子的 TTS；不会重新转录视频。可按需要调整：
 
 ```bash
 python3 youtube_dub.py URL --full --workdir output/full \
@@ -197,7 +192,7 @@ python3 youtube_dub.py URL --full --workdir output/full \
 
 `--max-tempo` 可设为 `1.0`–`1.5`。值越低越自然，但可能需要更多精简轮次；建议保持在 `1.10`–`1.15`。
 
-默认使用 Codex CLI 当前模型；需要显式指定时可传：
+默认记录调用 Skill 的 Agent 当前模型；需要标识该模型时可传：
 
 ```bash
 python3 youtube_dub.py URL --text-model MODEL_NAME

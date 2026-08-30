@@ -79,13 +79,6 @@ def is_download_only(args: argparse.Namespace, passthrough: list[str]) -> bool:
     return args.download_only or option_value(passthrough, "--stop-after") == "download"
 
 
-def needs_codex(args: argparse.Namespace, passthrough: list[str]) -> bool:
-    """Return whether the requested stage reaches a Codex-backed text step."""
-    if is_download_only(args, passthrough):
-        return False
-    return option_value(passthrough, "--stop-after") != "transcribe"
-
-
 def needs_openrouter(args: argparse.Namespace, passthrough: list[str]) -> bool:
     """Return whether the run reaches OpenRouter transcription or synthesis."""
     if is_download_only(args, passthrough):
@@ -299,7 +292,6 @@ def main() -> int:
         ("yt-dlp",)
         if args.dry_run
         else ("yt-dlp", "ffmpeg", "ffprobe")
-        + (("codex",) if needs_codex(args, passthrough) else ())
     )
     missing = [
         name

@@ -19,7 +19,6 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -44,8 +43,8 @@ DEFAULT_FIT_WORKERS = 4
 MAX_NETWORK_WORKERS = 16
 POLISH_BATCH_MAX_CHARACTERS = 9_000
 TRANSLATION_BATCH_MAX_CHARACTERS = 6_000
-TEXT_BACKEND = "codex-cli"
-TEXT_PIPELINE_VERSION = 3
+TEXT_BACKEND = "calling-agent"
+TEXT_PIPELINE_VERSION = 4
 TIMESTAMP_PIPELINE_VERSION = 1
 ALIGNMENT_PIPELINE_VERSION = 2
 BILIBILI_SUBTITLE_RENDER_VERSION = 2
@@ -112,12 +111,6 @@ def run(command: Sequence[str], *, capture: bool = False) -> subprocess.Complete
 
 def require_tools(args: argparse.Namespace) -> None:
     required = ["yt-dlp", "ffmpeg", "ffprobe"]
-    if (
-        not args.remux_only
-        and not args.subtitles_only
-        and stage_enabled(args.stop_after, "polish")
-    ):
-        required.append("codex")
     missing = [tool for tool in required if not shutil.which(tool)]
     if missing:
         raise PipelineError(f"缺少命令行工具：{', '.join(missing)}")
@@ -955,87 +948,54 @@ def parse_json_content(content: Any) -> dict[str, Any]:
 
 
 def text_model_name(args: argparse.Namespace) -> str:
-    return args.text_model or "Codex CLI default"
+    return args.text_model or "calling agent current model"
 
 
-def codex_json_completion(
+def agent_json_completion(
     args: argparse.Namespace,
+    workdir: Path,
     system: str,
     user: str,
     output_schema: dict[str, Any],
 ) -> dict[str, Any]:
-    """Run text-only work through Codex CLI, never through OpenRouter."""
-    executable = shutil.which("codex")
-    if not executable:
-        raise PipelineError(
-            "缺少 codex 命令。英文校对、主题识别、中文翻译和超时精简需要"
-            "已登录的本机 Codex CLI。"
-        )
-
-    prompt = (
-        "Complete this text transformation without reading files, using tools, or making network "
-        "requests yourself. Follow the editorial instructions exactly.\n\n"
-        f"EDITORIAL INSTRUCTIONS:\n{system}\n\nTASK INPUT:\n{user}\n\n"
-        "Return only the JSON value required by the supplied output schema."
+    """Exchange a structured text request with the agent running this Skill."""
+    request_fingerprint = json_fingerprint(
+        {"system": system, "user": user, "schema": output_schema}
     )
-    with tempfile.TemporaryDirectory(prefix="youtube-dub-codex-") as folder:
-        temporary_dir = Path(folder)
-        schema_path = temporary_dir / "output.schema.json"
-        output_path = temporary_dir / "result.json"
-        schema_path.write_text(
-            json.dumps(output_schema, ensure_ascii=False), encoding="utf-8"
-        )
-        command = [
-            executable,
-            "exec",
-            "--ephemeral",
-            "--ignore-user-config",
-            "--skip-git-repo-check",
-            "--sandbox",
-            "read-only",
-            "--color",
-            "never",
-            "--output-schema",
-            str(schema_path),
-            "--output-last-message",
-            str(output_path),
-        ]
-        if args.text_model:
-            command.extend(["--model", args.text_model])
-        command.append("-")
-
-        environment = os.environ.copy()
-        # The text subprocess must not receive OpenRouter credentials or an
-        # environment override that could redirect the OpenAI client there.
-        for name in (
-            "OPENROUTER_API_KEY",
-            "OPENAI_API_KEY",
-            "OPENAI_BASE_URL",
-            "OPENAI_API_BASE",
-            "OPENAI_API_HOST",
-        ):
-            environment.pop(name, None)
-        log(f"调用本机 Codex CLI 文本模型（{text_model_name(args)}）")
+    request_dir = workdir / "segments" / "agent_text_requests"
+    request_path = request_dir / f"{request_fingerprint}.request.json"
+    response_path = request_dir / f"{request_fingerprint}.response.json"
+    if response_path.exists():
         try:
-            completed = subprocess.run(
-                command,
-                cwd=temporary_dir,
-                env=environment,
-                input=prompt,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=True,
-            )
-        except subprocess.CalledProcessError as exc:
-            details = (exc.stderr or exc.stdout or "").strip()
-            if len(details) > 3000:
-                details = details[-3000:]
-            raise PipelineError(f"Codex CLI 文本处理失败：{details}") from exc
-        if not output_path.exists():
-            details = (completed.stderr or completed.stdout or "").strip()
-            raise PipelineError(f"Codex CLI 没有生成结构化结果：{details[-2000:]}")
-        return parse_json_content(output_path.read_text(encoding="utf-8"))
+            response = read_json(response_path)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise PipelineError(f"Agent 文本响应不是有效 JSON：{response_path}") from exc
+        if isinstance(response, dict) and "result" in response:
+            if response.get("request_fingerprint") != request_fingerprint:
+                raise PipelineError(f"Agent 文本响应不属于当前请求：{response_path}")
+            response = response["result"]
+        return parse_json_content(json.dumps(response, ensure_ascii=False))
+
+    write_json(
+        request_path,
+        {
+            "request_fingerprint": request_fingerprint,
+            "model": text_model_name(args),
+            "system": system,
+            "user": user,
+            "output_schema": output_schema,
+            "response_path": str(response_path),
+            "response_format": {
+                "request_fingerprint": request_fingerprint,
+                "result": "the JSON value required by output_schema",
+            },
+        },
+    )
+    raise PipelineError(
+        "需要调用 Skill 的 Agent 完成文本任务；请求已写入 "
+        f"{request_path}。使用当前后端模型按其中 system、user 和 output_schema 生成结果，"
+        f"再将 response_format 所示 JSON 写入 {response_path}，然后用完全相同的命令重跑。"
+    )
 
 
 def segment_translation_schema(*, include_topic: bool = False) -> dict[str, Any]:
@@ -1296,7 +1256,7 @@ def batch_english_for_polish(
     segments: Sequence[Segment],
     maximum_characters: int = POLISH_BATCH_MAX_CHARACTERS,
 ) -> list[list[Segment]]:
-    """Bound Codex output size while avoiding arbitrary ASR chunk boundaries."""
+    """Bound agent-model output size while avoiding arbitrary ASR chunk boundaries."""
     batches: list[list[Segment]] = []
     current: list[Segment] = []
     size = 0
@@ -1340,7 +1300,7 @@ def polish_transcript(
         ):
             log("复用已校对并按完整句子重分段的英文稿")
             return parse_segments(cached)
-        log("英文校对缓存不是当前 Codex 文本后端生成，将重新校对")
+        log("英文校对缓存不是当前 Agent 文本后端生成，将重新校对")
 
     system = (
         "You are a meticulous English transcript copy editor. The ASR chunks were cut at arbitrary "
@@ -1404,7 +1364,7 @@ def polish_transcript(
             generated = False
         else:
             log(f"英文校对批次 {batch_number}/{len(batches)}")
-            value = codex_json_completion(args, system, user_prompt, output_schema)
+            value = agent_json_completion(args, workdir, system, user_prompt, output_schema)
             generated = True
         sentence_values = value.get("sentences")
         if not isinstance(sentence_values, list) or not sentence_values:
@@ -1533,7 +1493,7 @@ def translate_segments(
         ):
             log("复用中文翻译")
             return parse_segments(cached)
-        log("英文稿或 Codex 文本后端已变化，将重新生成中文翻译")
+        log("英文稿或 Agent 文本后端已变化，将重新生成中文翻译")
 
     system = (
         "You are a senior domain expert, Chinese localization editor, and dubbing script adapter. "
@@ -1582,8 +1542,9 @@ def translate_segments(
             generated = False
         else:
             log(f"翻译批次 {batch_number}/{len(batches)}")
-            value = codex_json_completion(
+            value = agent_json_completion(
                 args,
+                workdir,
                 system,
                 user_prompt,
                 output_schema,
@@ -1987,8 +1948,9 @@ def shorten_translations_for_timing(
         "segments array containing exactly id and zh."
     )
     log(f"第 {attempt} 轮自动精简 {len(segments)} 个超时句子")
-    value = codex_json_completion(
+    value = agent_json_completion(
         args,
+        workdir,
         system,
         "Rewrite these dubbing lines:\n" + json.dumps(payload, ensure_ascii=False),
         segment_translation_schema(),
@@ -2911,7 +2873,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--text-model",
-        help="Codex CLI 文本模型；默认使用 Codex CLI 当前默认模型",
+        help="调用 Skill 的 Agent 所用文本模型标识；默认记录当前后端模型",
     )
     parser.add_argument(
         "--translator-model",
