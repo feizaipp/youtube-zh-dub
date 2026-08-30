@@ -10,7 +10,7 @@ Run the verified pipeline through `scripts/run_youtube_zh_dub.py`. Treat the com
 ## Execute
 
 1. Extract exactly one `youtube.com` or `youtu.be` URL from the request. Reject a missing or non-YouTube URL instead of guessing.
-2. Check that `OPENROUTER_API_KEY` exists for `openai/whisper-1` word-timestamp transcription and MAI TTS. Never print it, put it in a command argument, store it in the Skill, or recover it from chat history/plaintext files. If missing, ask the user to set it and stop. Also require an installed and authenticated `codex` command for English polishing, topic detection, Chinese translation, and timing rewrites.
+2. The default English transcription backend is local `faster-whisper` with the `medium.en` model, CPU execution, and INT8 compute. It does not require an API key. A complete dubbed-video run still requires `OPENROUTER_API_KEY` for MAI TTS; the optional `openrouter-whisper1` transcription backend also requires it. Never print the key, put it in a command argument, store it in the Skill, or recover it from chat history/plaintext files. Also require an installed and authenticated `codex` command for English polishing, topic detection, Chinese translation, and timing rewrites.
 3. Run from any working directory:
 
    ```bash
@@ -32,7 +32,7 @@ The launcher defaults to:
 - One output directory named after the YouTube title: `<skill-directory>/output/<video-title>`.
 - A sanitized title that preserves readable Unicode while replacing filesystem-invalid characters. Append the video ID only if another video already occupies the same title.
 - Maximum post-processing speed-up of `1.15x` and up to five translation-shortening attempts.
-- Bounded concurrency: three OpenRouter `openai/whisper-1` transcription workers, four MAI TTS workers, and four local ffmpeg fitting workers by default; override with `--transcribe-workers`, `--tts-workers`, and `--fit-workers` when rate limits and local CPU capacity allow.
+- Bounded concurrency: one local `faster-whisper` `medium.en` transcription task, four MAI TTS workers, and four local ffmpeg fitting workers by default; override with `--transcribe-workers`, `--tts-workers`, and `--fit-workers` when local CPU capacity or rate limits allow.
 - The bundled verified source pipeline at `<skill-directory>/youtube_dub.py`.
 - The project `.venv/bin` prepended to `PATH` when present.
 
@@ -67,6 +67,7 @@ Use the pipeline defaults unless the user asks otherwise. They enforce these inv
 - Default yt-dlp to the `web_embedded` YouTube player client; override with `--youtube-player-client` only when a demonstrated video-specific restriction requires it.
 - Retain raw English ASR and absolute word timestamps for audit, then correct repeated/broken cross-chunk grammar and align complete sentences back to real word boundaries.
 - Run independent ASR chunks, TTS sentences, and per-window ffmpeg fitting concurrently while preserving ID order, atomic checkpoints, resumability, and per-segment caches.
+- Load the local Whisper model once per run and retain its real word timestamps. The first run may download `medium.en`; subsequent runs reuse the local model cache.
 - Run English polishing, topic detection, Chinese translation, and overlong-line shortening through the local authenticated Codex CLI without passing it OpenRouter credentials.
 - Preserve the polished English timestamps exactly in the Chinese transcript.
 - Preserve real inter-sentence silence and fail explicitly if word timestamps are absent; never fall back to word-count/duration interpolation.

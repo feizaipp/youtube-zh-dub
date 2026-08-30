@@ -11,7 +11,8 @@
 - `ffmpeg`（同时提供 `ffprobe`）；
 - 生成哔哩哔哩硬字幕版需要中文字体，Ubuntu/Debian 推荐安装 `fonts-noto-cjk`；
 - 完整配音需要已安装并登录的 Codex CLI；
-- 完整配音需要通过环境变量提供 `OPENROUTER_API_KEY`（OpenAI whisper-1 词级转录和中文 TTS）；
+- 英文词级转录默认在本地运行 `faster-whisper medium.en`（CPU INT8），无需转录 API 费用；
+- 完整配音仍需通过环境变量提供 `OPENROUTER_API_KEY`（用于中文 TTS）；
 - 推荐安装 Node.js，供 `yt-dlp` 处理 YouTube JavaScript 校验。
 
 纯下载模式只需要 Python、`yt-dlp`、`ffmpeg` 和 `ffprobe`，不需要
@@ -36,7 +37,7 @@ sudo apt-get install fonts-noto-cjk
 这个命令行工具完成以下流程：
 
 1. 用一次 `yt-dlp` 任务同时下载最佳纯视频流和最佳纯音频流，并保留两个原始文件；
-2. 在本地按静音点切分音频，通过 OpenRouter 的专用转录端点并发调用 `openai/whisper-1`，取得每个英文词的真实起止时间并换算成全片绝对时间；
+2. 在本地按静音点切分音频，使用共享的 `faster-whisper medium.en` 模型取得每个英文词的真实起止时间并换算成全片绝对时间；
 3. 通过本机 Codex CLI 跨越原始切块检查英文语法和 ASR 重复词，再把完整句子按词序对齐回真实词级时间轴；句间原始停顿会被保留；
 4. 通过本机 Codex CLI 识别主题，以领域专家口吻翻译为简体中文，并锁定校对后句子的时间戳；
 5. 用有界线程池并发调用 MAI-Voice-2 生成逐句普通话配音，裁掉模型附带的首尾静音并测量真实讲话时长；
@@ -46,7 +47,7 @@ sudo apt-get install fonts-noto-cjk
 
 英文校对、主题识别、简体中文翻译和超时译文精简使用本机已登录的 `codex` 命令。Codex 子进程在独立临时目录中以只读模式运行，并且不会继承模型 API Key 或 API Base URL 覆盖项。
 
-OpenRouter 用于调用 `openai/whisper-1` 英文词级转录和 MAI 中文语音合成。不要把 API Key 写进源码或命令行，请通过环境变量提供：
+OpenRouter 默认只用于 MAI 中文语音合成；显式选择 `openrouter-whisper1` 时也用于英文词级转录。不要把 API Key 写进源码或命令行，请通过环境变量提供：
 
 ```bash
 export OPENROUTER_API_KEY='你的新 Key'
@@ -127,7 +128,7 @@ python3 youtube_dub.py URL --text-model MODEL_NAME
 
 ```bash
 python3 youtube_dub.py URL --full --workdir output/full \
-  --transcribe-workers 3 --tts-workers 4 --fit-workers 4
+  --transcribe-workers 1 --tts-workers 4 --fit-workers 4
 ```
 
 并发只发生在同一阶段的独立片段之间。转录结果和对齐报告仍按片段 ID 排序并由主线程原子保存；TTS 超时判断仍会等待本轮全部句子完成。遇到限流时降低网络线程数；本机负载过高时降低 `--fit-workers`，不要反复使用 `--force`。
@@ -138,7 +139,7 @@ python3 youtube_dub.py URL --full --workdir output/full \
 python3 youtube_dub.py URL --cookies-from-browser chrome
 ```
 
-各阶段可恢复；whisper-1 的词级结果按后端、模型和时间轴版本校验后缓存，旧的片段级缓存不会被误用。超长英文稿会尽量在完整句边界分批校对，中文翻译使用较小批次，并把每个成功批次单独缓存。若中途失败，重跑会安全复用兼容的已完成批次。未完成的 yt-dlp `.part` 文件也会断点续传。只有显式使用 `--force` 才会覆盖下载断点和重跑产物；`--stop-after transcribe` 可只调试到原始英文转录，`--stop-after polish` 可停在语法校对和完整句重分段之后。
+各阶段可恢复；Whisper 的词级结果按后端、模型、计算类型和时间轴版本校验后缓存，旧的片段级缓存不会被误用。超长英文稿会尽量在完整句边界分批校对，中文翻译使用较小批次，并把每个成功批次单独缓存。若中途失败，重跑会安全复用兼容的已完成批次。未完成的 yt-dlp `.part` 文件也会断点续传。只有显式使用 `--force` 才会覆盖下载断点和重跑产物；`--stop-after transcribe` 可只调试到原始英文转录，`--stop-after polish` 可停在语法校对和完整句重分段之后。
 
 若只需重建最终视频（例如修复播放器兼容性），无需重新调用模型：
 
@@ -163,7 +164,7 @@ python3 youtube_dub.py --workdir output/full --subtitles-only
 - `source_video_original.*`：yt-dlp 下载并保留的纯视频流；
 - `source_audio_original.*`：yt-dlp 下载并保留的纯音频流；
 - `source_audio.wav`：由上述原始音频转换得到的单声道 16 kHz 转录音频；
-- `transcript.en.json` / `.srt`：whisper-1 返回的原始切块英文稿；JSON 同时保留带绝对起止时间的词数组，供审计和恢复；
+- `transcript.en.json` / `.srt`：Whisper 返回的原始切块英文稿；JSON 同时保留带绝对起止时间的词数组，供审计和恢复；
 - `transcript.en.polished.json` / `.srt`：跨切块纠错并按完整句子重分段后的英文稿，JSON 同时记录重要修订；
 - `transcript.zh.json` / `.srt`：与校对后英文句子保持相同时间戳的中文稿及主题；JSON 还记录为控制语速进行的逐句精简历史；
 - `chinese_voice.wav`：对齐后的中文音轨；
@@ -209,4 +210,4 @@ rsync://HOST/MODULE/path/dubbed.zh.mp4
 
 没有真实 SSH 地址或 rsync daemon 配置时，不应虚构连接信息。
 
-时间轴以 whisper-1 返回的真实词级起止时间为依据。每个切块的相对词时间会加上切块起点，换算为全片绝对时间；校对模型只修改文本，不生成时间戳，程序通过词序对齐把校对后的完整句子映射回这些真实边界，并保留句间静音。若接口没有返回词级时间戳，管线会明确失败，不会退回按字数或片段时长估算，以免再次产生音画错位。
+时间轴以 Whisper 返回的真实词级起止时间为依据。每个切块的相对词时间会加上切块起点，换算为全片绝对时间；校对模型只修改文本，不生成时间戳，程序通过词序对齐把校对后的完整句子映射回这些真实边界，并保留句间静音。若后端没有返回词级时间戳，管线会明确失败，不会退回按字数或片段时长估算，以免再次产生音画错位。

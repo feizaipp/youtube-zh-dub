@@ -52,16 +52,24 @@ class SkillLauncherTests(unittest.TestCase):
         args = argparse.Namespace(download_only=True)
         self.assertFalse(launcher.needs_openrouter(args, []))
 
-    def test_transcribe_only_requires_openrouter(self):
+    def test_local_transcribe_only_does_not_require_openrouter(self):
         args = argparse.Namespace(download_only=False)
         passthrough = ["--stop-after", "transcribe"]
-        self.assertTrue(launcher.needs_openrouter(args, passthrough))
+        self.assertFalse(launcher.needs_openrouter(args, passthrough))
 
-    def test_translate_only_requires_openrouter_for_transcription(self):
+    def test_local_translate_only_does_not_require_openrouter(self):
         args = argparse.Namespace(download_only=False)
-        self.assertTrue(
+        self.assertFalse(
             launcher.needs_openrouter(args, ["--stop-after", "translate"])
         )
+
+    def test_remote_transcribe_only_requires_openrouter(self):
+        args = argparse.Namespace(download_only=False)
+        passthrough = [
+            "--stop-after", "transcribe",
+            "--transcriber-backend", "openrouter-whisper1",
+        ]
+        self.assertTrue(launcher.needs_openrouter(args, passthrough))
 
     def test_full_pipeline_requires_openrouter(self):
         args = argparse.Namespace(download_only=False)

@@ -31,11 +31,13 @@ from typing import Any, Callable, Iterable, Sequence
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_URL = "https://www.youtube.com/watch?v=2cTDRKRQ5oc"
-DEFAULT_TRANSCRIBER = "openai/whisper-1"
-DEFAULT_TRANSCRIBER_BACKEND = "openrouter-whisper1"
+DEFAULT_TRANSCRIBER = "medium.en"
+DEFAULT_TRANSCRIBER_BACKEND = "faster-whisper"
+DEFAULT_WHISPER_DEVICE = "cpu"
+DEFAULT_WHISPER_COMPUTE_TYPE = "int8"
 DEFAULT_TTS = "microsoft/mai-voice-2"
 DEFAULT_VOICE = "zh-CN-Mei:MAI-Voice-2"
-DEFAULT_TRANSCRIBE_WORKERS = 3
+DEFAULT_TRANSCRIBE_WORKERS = 1
 DEFAULT_TTS_WORKERS = 4
 DEFAULT_FIT_WORKERS = 4
 MAX_NETWORK_WORKERS = 16
@@ -704,6 +706,44 @@ def transcribe_segment(
     return Segment(index, start, end, text), words
 
 
+def transcribe_segment_locally(
+    model: Any,
+    audio: Path,
+    segment_dir: Path,
+    index: int,
+    start: float,
+    end: float,
+) -> tuple[Segment, list[TimedWord]]:
+    """Extract and transcribe one ASR segment with a shared faster-whisper model."""
+    chunk = segment_dir / f"segment_{index:04d}.wav"
+    extract_segment(audio, chunk, start, end)
+    generated_segments, _info = model.transcribe(
+        str(chunk),
+        language="en",
+        temperature=0,
+        beam_size=5,
+        word_timestamps=True,
+        vad_filter=False,
+    )
+    local_segments = list(generated_segments)
+    text = " ".join(item.text.strip() for item in local_segments if item.text.strip()).strip()
+    if not text:
+        raise PipelineError(f"本地转录模型没有为片段 {index} 返回文本")
+    words: list[TimedWord] = []
+    for segment in local_segments:
+        for item in segment.words or ():
+            word = str(item.word).strip()
+            word_start = start + float(item.start)
+            word_end = start + float(item.end)
+            if word and word_end > word_start:
+                words.append(TimedWord(word, round(word_start, 3), round(word_end, 3)))
+    if not words:
+        raise PipelineError(
+            f"本地转录片段 {index} 没有词级时间戳；禁止退回按字数估算时间轴"
+        )
+    return Segment(index, start, end, text), words
+
+
 def transcribe_audio(
     args: argparse.Namespace, workdir: Path, audio: Path
 ) -> list[Segment]:
@@ -718,6 +758,14 @@ def transcribe_audio(
             cached_document.get("timestamp_pipeline_version") == TIMESTAMP_PIPELINE_VERSION
             and cached_document.get("backend") == args.transcriber_backend
             and cached_document.get("model") == args.transcriber_model
+            and (
+                args.transcriber_backend != "faster-whisper"
+                or (
+                    cached_document.get("device") == args.whisper_device
+                    and cached_document.get("compute_type")
+                    == args.whisper_compute_type
+                )
+            )
         )
         if (
             cached_document.get("complete")
@@ -775,10 +823,23 @@ def transcribe_audio(
                 "source_start_seconds": args.start_seconds,
                 "duration": duration,
                 "timestamp_basis": "seconds relative to source.mp4",
-                "timestamp_method": "OpenRouter openai/whisper-1 word timestamps with absolute chunk offsets",
+                "timestamp_method": (
+                    f"{args.transcriber_backend} {args.transcriber_model} word timestamps "
+                    "with absolute chunk offsets"
+                ),
                 "timestamp_pipeline_version": TIMESTAMP_PIPELINE_VERSION,
                 "backend": args.transcriber_backend,
                 "model": args.transcriber_model,
+                "device": (
+                    args.whisper_device
+                    if args.transcriber_backend == "faster-whisper"
+                    else None
+                ),
+                "compute_type": (
+                    args.whisper_compute_type
+                    if args.transcriber_backend == "faster-whisper"
+                    else None
+                ),
                 "workers": args.transcribe_workers,
                 "segments": [asdict(item) for item in ordered],
                 "words": ordered_words,
@@ -787,7 +848,27 @@ def transcribe_audio(
         )
 
     if pending:
-        api_key = require_openrouter_api_key("OpenAI whisper-1 英文转录")
+        api_key: str | None = None
+        local_model: Any = None
+        if args.transcriber_backend == "openrouter-whisper1":
+            api_key = require_openrouter_api_key("OpenAI whisper-1 英文转录")
+        else:
+            try:
+                from faster_whisper import WhisperModel
+            except ImportError as exc:
+                raise PipelineError(
+                    "本地转录需要 faster-whisper；请先安装项目依赖"
+                ) from exc
+            log(
+                f"加载本地 Whisper 模型 {args.transcriber_model} "
+                f"（{args.whisper_device}/{args.whisper_compute_type}）"
+            )
+            local_model = WhisperModel(
+                args.transcriber_model,
+                device=args.whisper_device,
+                compute_type=args.whisper_compute_type,
+                cpu_threads=args.whisper_cpu_threads,
+            )
         worker_count = min(args.transcribe_workers, len(pending))
         log(f"并发转录 {len(pending)} 个片段（{worker_count} 个线程）")
         failures: list[tuple[int, Exception]] = []
@@ -796,16 +877,28 @@ def transcribe_audio(
             max_workers=worker_count, thread_name_prefix="youtube-dub-asr"
         ) as executor:
             for index, start, end in pending:
-                future = executor.submit(
-                    transcribe_segment,
-                    args,
-                    audio,
-                    segment_dir,
-                    index,
-                    start,
-                    end,
-                    api_key,
-                )
+                if args.transcriber_backend == "faster-whisper":
+                    future = executor.submit(
+                        transcribe_segment_locally,
+                        local_model,
+                        audio,
+                        segment_dir,
+                        index,
+                        start,
+                        end,
+                    )
+                else:
+                    assert api_key is not None
+                    future = executor.submit(
+                        transcribe_segment,
+                        args,
+                        audio,
+                        segment_dir,
+                        index,
+                        start,
+                        end,
+                        api_key,
+                    )
                 futures[future] = index
             for future in as_completed(futures):
                 index = futures[future]
@@ -1345,7 +1438,7 @@ def polish_transcript(
         {
             "source_url": args.url,
             "source_fingerprint": source_fingerprint,
-            "timestamp_basis": "corrected sentences aligned to whisper-1 word start/end timestamps",
+            "timestamp_basis": "corrected sentences aligned to Whisper word start/end timestamps",
             "timestamp_pipeline_version": TIMESTAMP_PIPELINE_VERSION,
             "alignment_pipeline_version": ALIGNMENT_PIPELINE_VERSION,
             "text_backend": TEXT_BACKEND,
@@ -2482,15 +2575,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--transcriber-model", default=DEFAULT_TRANSCRIBER)
     parser.add_argument(
         "--transcriber-backend",
-        choices=("openrouter-whisper1",),
+        choices=("faster-whisper", "openrouter-whisper1"),
         default=DEFAULT_TRANSCRIBER_BACKEND,
-        help="英文转录后端；默认通过 OpenRouter 调用 OpenAI whisper-1 词级时间戳",
+        help="英文转录后端；默认使用本地 faster-whisper",
     )
     parser.add_argument(
         "--transcribe-workers",
         type=int,
         default=DEFAULT_TRANSCRIBE_WORKERS,
-        help="英文转录并发线程数，默认 3",
+        help="英文转录并发任务数；本地模型默认 1",
+    )
+    parser.add_argument("--whisper-device", default=DEFAULT_WHISPER_DEVICE)
+    parser.add_argument(
+        "--whisper-compute-type", default=DEFAULT_WHISPER_COMPUTE_TYPE
+    )
+    parser.add_argument(
+        "--whisper-cpu-threads",
+        type=int,
+        default=max(1, min(8, os.cpu_count() or 1)),
+        help="本地 Whisper 使用的 CPU 线程数，默认最多 8",
     )
     parser.add_argument(
         "--text-model",
@@ -2580,10 +2683,15 @@ def validate_args(args: argparse.Namespace) -> None:
         raise PipelineError("--start-seconds 不能小于 0")
     if args.chunk_seconds < 4:
         raise PipelineError("--chunk-seconds 不能小于 4")
-    if args.transcriber_model != "openai/whisper-1":
+    if (
+        args.transcriber_backend == "openrouter-whisper1"
+        and args.transcriber_model != "openai/whisper-1"
+    ):
         raise PipelineError(
             "openrouter-whisper1 后端必须使用 --transcriber-model openai/whisper-1"
         )
+    if args.whisper_cpu_threads < 1:
+        raise PipelineError("--whisper-cpu-threads 必须大于 0")
     if not 1 <= args.transcribe_workers <= MAX_NETWORK_WORKERS:
         raise PipelineError(
             f"--transcribe-workers 必须在 1 到 {MAX_NETWORK_WORKERS} 之间"
@@ -2620,6 +2728,14 @@ def ensure_manifest(args: argparse.Namespace, workdir: Path) -> None:
     write_json(manifest_path, {"input": mode, "models": {
         "transcriber": args.transcriber_model,
         "transcriber_backend": args.transcriber_backend,
+        "transcriber_device": (
+            args.whisper_device if args.transcriber_backend == "faster-whisper" else None
+        ),
+        "transcriber_compute_type": (
+            args.whisper_compute_type
+            if args.transcriber_backend == "faster-whisper"
+            else None
+        ),
         "text_backend": TEXT_BACKEND,
         "text": text_model_name(args),
         "tts": args.tts_model,

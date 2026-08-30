@@ -217,7 +217,9 @@ class AudioFilterTests(unittest.TestCase):
 class ConcurrencyTests(unittest.TestCase):
     def test_default_worker_counts_are_bounded(self):
         args = youtube_dub.build_parser().parse_args([])
-        self.assertEqual(args.transcribe_workers, 3)
+        self.assertEqual(args.transcriber_backend, "faster-whisper")
+        self.assertEqual(args.transcriber_model, "medium.en")
+        self.assertEqual(args.transcribe_workers, 1)
         self.assertEqual(args.tts_workers, 4)
         self.assertEqual(args.fit_workers, 4)
 
