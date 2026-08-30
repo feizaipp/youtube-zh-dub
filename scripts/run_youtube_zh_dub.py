@@ -94,7 +94,8 @@ def needs_openrouter(args: argparse.Namespace, passthrough: list[str]) -> bool:
     if backend == "openrouter-whisper1":
         return True
     stop_after = option_value(passthrough, "--stop-after") or "mux"
-    return stop_after in {"synthesize", "mux"}
+    tts_backend = option_value(passthrough, "--tts-backend") or "cosyvoice3-source"
+    return tts_backend == "mai" and stop_after in {"synthesize", "mux"}
 
 
 def safe_directory_name(title: str, video_id: str) -> str:
@@ -290,7 +291,7 @@ def main() -> int:
     download_only = is_download_only(args, passthrough)
     if not args.dry_run and needs_openrouter(args, passthrough) and not environment.get("OPENROUTER_API_KEY"):
         print(
-            "错误：请先通过环境变量 OPENROUTER_API_KEY 提供 OpenRouter API Key（用于所选远程转录后端或中文语音合成）。",
+            "错误：请先通过环境变量 OPENROUTER_API_KEY 提供 OpenRouter API Key（用于所选远程转录后端或 MAI 中文语音合成）。",
             file=sys.stderr,
         )
         return 2

@@ -35,6 +35,7 @@ DEFAULT_TRANSCRIBER = "medium.en"
 DEFAULT_TRANSCRIBER_BACKEND = "faster-whisper"
 DEFAULT_WHISPER_DEVICE = "cpu"
 DEFAULT_WHISPER_COMPUTE_TYPE = "int8"
+DEFAULT_TTS_BACKEND = "cosyvoice3-source"
 DEFAULT_TTS = "microsoft/mai-voice-2"
 DEFAULT_VOICE = "zh-CN-Mei:MAI-Voice-2"
 DEFAULT_TRANSCRIBE_WORKERS = 1
@@ -1649,6 +1650,7 @@ def tts_cache_key(args: argparse.Namespace, text: str) -> str:
         json.dumps(
             {
                 "text": text,
+                "backend": args.tts_backend,
                 "model": args.tts_model,
                 "voice": args.voice,
                 "speed": args.tts_speed,
@@ -1657,6 +1659,117 @@ def tts_cache_key(args: argparse.Namespace, text: str) -> str:
             sort_keys=True,
         ).encode("utf-8")
     ).hexdigest()[:12]
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def cosyvoice_paths(args: argparse.Namespace) -> tuple[Path, Path, Path, Path]:
+    root_value = args.cosyvoice_root or os.environ.get("COSYVOICE_ROOT")
+    root = Path(root_value).expanduser() if root_value else Path(__file__).resolve().parent.parent / "cosyvoice"
+    python_value = args.cosyvoice_python or os.environ.get("COSYVOICE_PYTHON")
+    python = Path(python_value).expanduser() if python_value else root.parent / "miniconda-cosyvoice" / "bin" / "python"
+    model_value = args.cosyvoice_model or os.environ.get("COSYVOICE_MODEL")
+    model = Path(model_value).expanduser() if model_value else root / "pretrained_models" / "Fun-CosyVoice3-0.5B"
+    worker = Path(__file__).resolve().parent / "scripts" / "run_cosyvoice3_source_tts.py"
+    return root.resolve(), python.resolve(), model.resolve(), worker
+
+
+def tts_audit_model(args: argparse.Namespace) -> str:
+    if args.tts_backend == "cosyvoice3-source":
+        return cosyvoice_paths(args)[2].name
+    return args.tts_model
+
+
+def tts_audit_voice(args: argparse.Namespace) -> str:
+    if args.tts_backend == "cosyvoice3-source":
+        return "per-segment source voice reference"
+    return args.voice
+
+
+def source_reference_audio(workdir: Path, segment: Segment) -> Path:
+    reference_dir = workdir / "segments" / "source_voice_reference"
+    reference_dir.mkdir(parents=True, exist_ok=True)
+    source = workdir / "source_audio.wav"
+    source_stat = source.stat()
+    reference_key = hashlib.sha256(
+        f"{source.resolve()}:{source_stat.st_size}:{source_stat.st_mtime_ns}:"
+        f"{segment.start:.3f}:{segment.end:.3f}".encode("utf-8")
+    ).hexdigest()[:12]
+    reference = reference_dir / f"segment_{segment.id:04d}_{reference_key}.wav"
+    if not reference.exists():
+        extract_segment(source, reference, segment.start, segment.end)
+    return reference
+
+
+def prepare_cosyvoice3_sources(
+    args: argparse.Namespace,
+    workdir: Path,
+    segments: Sequence[Segment],
+    raw_dir: Path,
+    trimmed_dir: Path,
+    *,
+    force: bool = False,
+) -> dict[int, tuple[Path, float, str]]:
+    root, python, model, worker = cosyvoice_paths(args)
+    required = (root / "cosyvoice", root / "third_party" / "Matcha-TTS", model, python, worker)
+    missing = [str(path) for path in required if not path.exists()]
+    if missing:
+        raise PipelineError("CosyVoice3 本地后端缺少：" + "、".join(missing))
+
+    jobs: list[dict[str, Any]] = []
+    outputs: dict[int, tuple[Path, Path, str]] = {}
+    model_marker = model / "llm.pt"
+    model_stat = model_marker.stat() if model_marker.exists() else model.stat()
+    model_identity = (
+        f"{model.resolve()}:{model_stat.st_size}:{model_stat.st_mtime_ns}"
+    )
+    for segment in segments:
+        reference = source_reference_audio(workdir, segment)
+        cache_key = hashlib.sha256(
+            f"{tts_cache_key(args, segment.text)}:{model_identity}:"
+            f"{file_sha256(reference)}".encode("utf-8")
+        ).hexdigest()[:12]
+        raw = raw_dir / f"segment_{segment.id:04d}_{cache_key}.wav"
+        trimmed = trimmed_dir / f"segment_{segment.id:04d}_{cache_key}_trim_v1.wav"
+        if force:
+            raw.unlink(missing_ok=True)
+            trimmed.unlink(missing_ok=True)
+        outputs[segment.id] = (raw, trimmed, cache_key)
+        if not raw.exists():
+            jobs.append({
+                "id": segment.id,
+                "text": segment.text,
+                "reference_audio": str(reference),
+                "output": str(raw),
+            })
+
+    if jobs:
+        jobs_path = workdir / "segments" / "cosyvoice3_jobs.json"
+        write_json(jobs_path, jobs)
+        log(f"顺序生成 {len(jobs)} 个源音色 CosyVoice3 片段（单模型实例）")
+        run([
+            str(python), str(worker),
+            "--cosyvoice-root", str(root),
+            "--model", str(model),
+            "--jobs", str(jobs_path),
+            "--threads", str(args.cosyvoice_threads),
+        ])
+
+    prepared = {}
+    for segment in segments:
+        raw, trimmed, cache_key = outputs[segment.id]
+        if not raw.exists():
+            raise PipelineError(f"CosyVoice3 未生成片段 {segment.id}")
+        if not trimmed.exists() or trimmed.stat().st_mtime < raw.stat().st_mtime:
+            trim_tts_edge_silence(raw, trimmed)
+        prepared[segment.id] = (trimmed, probe_duration(trimmed), cache_key)
+    return prepared
 
 
 def trim_tts_edge_silence(source: Path, destination: Path) -> None:
@@ -1755,6 +1868,7 @@ def ensure_tts_source(
 
 def prepare_tts_sources(
     args: argparse.Namespace,
+    workdir: Path,
     segments: Sequence[Segment],
     raw_dir: Path,
     trimmed_dir: Path,
@@ -1764,6 +1878,10 @@ def prepare_tts_sources(
     """Generate or reuse independent TTS segments with bounded concurrency."""
     if not segments:
         return {}
+    if args.tts_backend == "cosyvoice3-source":
+        return prepare_cosyvoice3_sources(
+            args, workdir, segments, raw_dir, trimmed_dir, force=force
+        )
     worker_count = min(args.tts_workers, len(segments))
     log(f"并发准备 {len(segments)} 个 TTS 片段（{worker_count} 个线程）")
     prepared: dict[int, tuple[Path, float, str]] = {}
@@ -2146,8 +2264,9 @@ def synthesize_dub(
     def make_synthesis_fingerprint(segments: Sequence[Segment]) -> str:
         settings = {
             "source_fingerprint": segments_fingerprint(segments),
-            "model": args.tts_model,
-            "voice": args.voice,
+            "tts_backend": args.tts_backend,
+            "model": tts_audit_model(args),
+            "voice": tts_audit_voice(args),
             "speed": args.tts_speed,
             "max_tempo": args.max_tempo,
             "edge_trim_version": 1,
@@ -2193,6 +2312,7 @@ def synthesize_dub(
         )
         prepared = prepare_tts_sources(
             args,
+            workdir,
             working,
             raw_dir,
             trimmed_dir,
@@ -2245,8 +2365,9 @@ def synthesize_dub(
                 "complete": False,
                 "source_fingerprint": source_fingerprint,
                 "synthesis_fingerprint": synthesis_fingerprint,
-                "model": args.tts_model,
-                "voice": args.voice,
+                "tts_backend": args.tts_backend,
+                "model": tts_audit_model(args),
+                "voice": tts_audit_voice(args),
                 "speed": args.tts_speed,
                 "tts_workers": args.tts_workers,
                 "fit_workers": args.fit_workers,
@@ -2281,8 +2402,9 @@ def synthesize_dub(
             "complete": True,
             "source_fingerprint": source_fingerprint,
             "synthesis_fingerprint": synthesis_fingerprint,
-            "model": args.tts_model,
-            "voice": args.voice,
+            "tts_backend": args.tts_backend,
+            "model": tts_audit_model(args),
+            "voice": tts_audit_voice(args),
             "speed": args.tts_speed,
             "tts_workers": args.tts_workers,
             "fit_workers": args.fit_workers,
@@ -2604,9 +2726,24 @@ def build_parser() -> argparse.ArgumentParser:
         dest="text_model",
         help=argparse.SUPPRESS,
     )
+    parser.add_argument(
+        "--tts-backend",
+        choices=("cosyvoice3-source", "mai"),
+        default=DEFAULT_TTS_BACKEND,
+        help="中文 TTS 后端；默认用源片段作为 Fun-CosyVoice3 参考音色",
+    )
     parser.add_argument("--tts-model", default=DEFAULT_TTS)
     parser.add_argument("--voice", default=DEFAULT_VOICE)
     parser.add_argument("--tts-speed", type=float, default=1.0)
+    parser.add_argument("--cosyvoice-root", type=Path)
+    parser.add_argument("--cosyvoice-python", type=Path)
+    parser.add_argument("--cosyvoice-model", type=Path)
+    parser.add_argument(
+        "--cosyvoice-threads",
+        type=int,
+        default=2,
+        help="CosyVoice3 CPU 计算线程数；模型始终单实例顺序生成",
+    )
     parser.add_argument(
         "--tts-workers",
         type=int,
@@ -2692,6 +2829,8 @@ def validate_args(args: argparse.Namespace) -> None:
         )
     if args.whisper_cpu_threads < 1:
         raise PipelineError("--whisper-cpu-threads 必须大于 0")
+    if args.cosyvoice_threads < 1:
+        raise PipelineError("--cosyvoice-threads 必须大于 0")
     if not 1 <= args.transcribe_workers <= MAX_NETWORK_WORKERS:
         raise PipelineError(
             f"--transcribe-workers 必须在 1 到 {MAX_NETWORK_WORKERS} 之间"
@@ -2738,8 +2877,9 @@ def ensure_manifest(args: argparse.Namespace, workdir: Path) -> None:
         ),
         "text_backend": TEXT_BACKEND,
         "text": text_model_name(args),
-        "tts": args.tts_model,
-        "voice": args.voice,
+        "tts_backend": args.tts_backend,
+        "tts": tts_audit_model(args),
+        "voice": tts_audit_voice(args),
     }, "execution": {
         "transcribe_workers": args.transcribe_workers,
         "tts_workers": args.tts_workers,

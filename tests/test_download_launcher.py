@@ -71,9 +71,13 @@ class SkillLauncherTests(unittest.TestCase):
         ]
         self.assertTrue(launcher.needs_openrouter(args, passthrough))
 
-    def test_full_pipeline_requires_openrouter(self):
+    def test_default_source_voice_pipeline_does_not_require_openrouter(self):
         args = argparse.Namespace(download_only=False)
-        self.assertTrue(launcher.needs_openrouter(args, []))
+        self.assertFalse(launcher.needs_openrouter(args, []))
+
+    def test_mai_pipeline_requires_openrouter(self):
+        args = argparse.Namespace(download_only=False)
+        self.assertTrue(launcher.needs_openrouter(args, ["--tts-backend", "mai"]))
 
 
 if __name__ == "__main__":

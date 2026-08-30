@@ -220,6 +220,7 @@ class ConcurrencyTests(unittest.TestCase):
         self.assertEqual(args.transcriber_backend, "faster-whisper")
         self.assertEqual(args.transcriber_model, "medium.en")
         self.assertEqual(args.transcribe_workers, 1)
+        self.assertEqual(args.tts_backend, "cosyvoice3-source")
         self.assertEqual(args.tts_workers, 4)
         self.assertEqual(args.fit_workers, 4)
 
@@ -294,7 +295,7 @@ class ConcurrencyTests(unittest.TestCase):
         self.assertEqual(document["words"][2]["start"], 10.1)
 
     def test_tts_preparation_runs_concurrently(self):
-        args = argparse.Namespace(tts_workers=4)
+        args = argparse.Namespace(tts_workers=4, tts_backend="mai")
         segments = [
             youtube_dub.Segment(index, float(index), float(index + 1), f"句子{index}。")
             for index in range(4)
@@ -320,11 +321,75 @@ class ConcurrencyTests(unittest.TestCase):
             youtube_dub, "ensure_tts_source", side_effect=fake_prepare
         ):
             prepared = youtube_dub.prepare_tts_sources(
-                args, segments, Path("raw"), Path("trimmed")
+                args, Path("work"), segments, Path("raw"), Path("trimmed")
             )
 
         self.assertGreaterEqual(maximum_active, 2)
         self.assertEqual(sorted(prepared), [0, 1, 2, 3])
+
+    def test_cosyvoice_source_backend_batches_jobs_and_hashes_references(self):
+        args = argparse.Namespace(
+            tts_backend="cosyvoice3-source",
+            tts_model="Fun-CosyVoice3-0.5B",
+            voice="source",
+            tts_speed=1.0,
+            cosyvoice_threads=2,
+        )
+        segments = [youtube_dub.Segment(0, 1.0, 3.0, "测试中文。")]
+
+        with tempfile.TemporaryDirectory() as folder:
+            workdir = Path(folder)
+            (workdir / "source_audio.wav").write_bytes(b"source audio")
+            raw_dir = workdir / "segments" / "tts_raw"
+            trimmed_dir = workdir / "segments" / "tts_trimmed"
+            raw_dir.mkdir(parents=True)
+            trimmed_dir.mkdir(parents=True)
+            root = workdir / "cosyvoice"
+            (root / "cosyvoice").mkdir(parents=True)
+            (root / "third_party" / "Matcha-TTS").mkdir(parents=True)
+            model = root / "model"
+            model.mkdir()
+            python = workdir / "python"
+            python.write_text("", encoding="utf-8")
+            worker = workdir / "worker.py"
+            worker.write_text("", encoding="utf-8")
+
+            def fake_extract(_source, destination, start, end):
+                self.assertEqual((start, end), (1.0, 3.0))
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(b"reference voice")
+
+            def fake_run(command, **_kwargs):
+                jobs_path = Path(command[command.index("--jobs") + 1])
+                jobs = youtube_dub.read_json(jobs_path)
+                self.assertEqual(len(jobs), 1)
+                self.assertEqual(jobs[0]["text"], "测试中文。")
+                Path(jobs[0]["output"]).write_bytes(b"raw wav")
+
+            def fake_trim(_source, destination):
+                destination.write_bytes(b"trimmed wav")
+
+            with mock.patch.object(
+                youtube_dub, "cosyvoice_paths", return_value=(root, python, model, worker)
+            ), mock.patch.object(
+                youtube_dub, "extract_segment", side_effect=fake_extract
+            ), mock.patch.object(
+                youtube_dub, "run", side_effect=fake_run
+            ), mock.patch.object(
+                youtube_dub, "trim_tts_edge_silence", side_effect=fake_trim
+            ), mock.patch.object(
+                youtube_dub, "probe_duration", return_value=1.5
+            ):
+                prepared = youtube_dub.prepare_tts_sources(
+                    args, workdir, segments, raw_dir, trimmed_dir
+                )
+
+            self.assertEqual(prepared[0][1], 1.5)
+            self.assertTrue(prepared[0][0].exists())
+            references = list(
+                (workdir / "segments" / "source_voice_reference").glob("segment_0000_*.wav")
+            )
+            self.assertEqual(len(references), 1)
 
     def test_audio_fitting_runs_concurrently_and_restores_source_order(self):
         args = argparse.Namespace(fit_workers=4, max_tempo=1.15)

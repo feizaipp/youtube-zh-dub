@@ -12,11 +12,69 @@
 - 生成哔哩哔哩硬字幕版需要中文字体，Ubuntu/Debian 推荐安装 `fonts-noto-cjk`；
 - 完整配音需要已安装并登录的 Codex CLI；
 - 英文词级转录默认在本地运行 `faster-whisper medium.en`（CPU INT8），无需转录 API 费用；
-- 完整配音仍需通过环境变量提供 `OPENROUTER_API_KEY`（用于中文 TTS）；
+- 默认中文配音使用本地 Fun-CosyVoice3-0.5B，并要求可用的 CosyVoice 源码、模型和独立 Python 环境；
+- 仅在选择 `--tts-backend mai` 或远程 Whisper 时需要 `OPENROUTER_API_KEY`；
 - 推荐安装 Node.js，供 `yt-dlp` 处理 YouTube JavaScript 校验。
 
 纯下载模式只需要 Python、`yt-dlp`、`ffmpeg` 和 `ffprobe`，不需要
 任何模型 Key 或 Codex CLI。
+
+## 给其他 Agent 的快速部署
+
+以下步骤从一台干净的 Debian/Ubuntu 主机开始，采用显式路径，不依赖 Skill
+目录相邻的默认布局。这样在不同 agent、工作目录或容器之间迁移时不会误用
+Python 环境或模型。
+
+```bash
+sudo apt-get update
+sudo apt-get install -y ffmpeg fonts-noto-cjk git python3-venv
+
+git clone https://github.com/feizaipp/youtube-zh-dub.git \
+  ~/.codex/skills/youtube-zh-dub
+cd ~/.codex/skills/youtube-zh-dub
+python3 -m venv .venv
+.venv/bin/python -m pip install -U pip
+.venv/bin/python -m pip install -r requirements.txt
+
+# 依照 CosyVoice 官方安装说明创建独立环境，并取得 Fun-CosyVoice3-0.5B。
+git clone --recursive https://github.com/FunAudioLLM/CosyVoice.git ~/CosyVoice
+conda create -y -n cosyvoice python=3.10
+conda run -n cosyvoice python -m pip install -r ~/CosyVoice/requirements.txt
+modelscope download --model FunAudioLLM/Fun-CosyVoice3-0.5B \
+  --local_dir ~/CosyVoice/pretrained_models/Fun-CosyVoice3-0.5B
+```
+
+`conda` 和 `modelscope` 不在基础系统中时，应先按 CosyVoice 官方文档安装；
+不要把 CosyVoice 包安装进 Skill 的 `.venv`。运行完整工作流还需安装并登录
+Codex CLI：`codex --version` 应能成功执行。YouTube 的 JavaScript 校验通常还
+需要 Node.js；若下载报缺少 JS runtime，应先安装 Node.js，再重试同一命令。
+
+先做不下载模型的静态检查：
+
+```bash
+cd ~/.codex/skills/youtube-zh-dub
+.venv/bin/python -m py_compile youtube_dub.py scripts/run_youtube_zh_dub.py
+.venv/bin/python scripts/run_youtube_zh_dub.py \
+  'https://youtu.be/dQw4w9WgXcQ' --download-only --dry-run --video-title smoke-test
+```
+
+然后用明确的 CosyVoice 参数跑 45 秒验证片段。`--cosyvoice-threads 2` 与
+`--fit-workers 2` 是 8 GiB 内存机器的保守起点；本地 TTS 始终只加载一个模型，
+不要用 `--tts-workers` 增加 CosyVoice 并发。
+
+```bash
+PATH="$PWD/.venv/bin:$PATH" python3 scripts/run_youtube_zh_dub.py URL \
+  --debug-seconds 45 --workdir /absolute/path/youtube-dub-smoke \
+  --cosyvoice-root "$HOME/CosyVoice" \
+  --cosyvoice-python "$(conda run -n cosyvoice which python)" \
+  --cosyvoice-model "$HOME/CosyVoice/pretrained_models/Fun-CosyVoice3-0.5B" \
+  --cosyvoice-threads 2 --fit-workers 2
+```
+
+确认验证目录中已有 `transcript.zh.srt`、`sync_report.json` 和最终视频后，再将
+同一命令中的 `--debug-seconds 45` 删除以处理全片。任务中断、终端关闭或内存
+回收后，使用**完全相同的 `--workdir` 和参数**重跑；管线会复用下载、转录、
+翻译和已完成的句子音频。不要加 `--force`，除非明确需要丢弃缓存重做。
 
 ```bash
 git clone https://github.com/feizaipp/youtube-zh-dub.git \
@@ -40,14 +98,14 @@ sudo apt-get install fonts-noto-cjk
 2. 在本地按静音点切分音频，使用共享的 `faster-whisper medium.en` 模型取得每个英文词的真实起止时间并换算成全片绝对时间；
 3. 通过本机 Codex CLI 跨越原始切块检查英文语法和 ASR 重复词，再把完整句子按词序对齐回真实词级时间轴；句间原始停顿会被保留；
 4. 通过本机 Codex CLI 识别主题，以领域专家口吻翻译为简体中文，并锁定校对后句子的时间戳；
-5. 用有界线程池并发调用 MAI-Voice-2 生成逐句普通话配音，裁掉模型附带的首尾静音并测量真实讲话时长；
+5. 默认从每个英文句子的原始时间窗提取参考语音，用单实例 Fun-CosyVoice3 跨语言克隆当前说话人的音色并顺序生成中文；也可选择 MAI-Voice-2；
 6. 超过舒适语速上限的句子会由本机 Codex CLI 自动精简并重新生成，最后用 `ffmpeg` 轻微调速、补静音、替换视频音轨；同时输出带可开关软字幕的通用版，以及把中文字幕烧录进画面的哔哩哔哩上传版。
 
 ## 安全设置
 
 英文校对、主题识别、简体中文翻译和超时译文精简使用本机已登录的 `codex` 命令。Codex 子进程在独立临时目录中以只读模式运行，并且不会继承模型 API Key 或 API Base URL 覆盖项。
 
-OpenRouter 默认只用于 MAI 中文语音合成；显式选择 `openrouter-whisper1` 时也用于英文词级转录。不要把 API Key 写进源码或命令行，请通过环境变量提供：
+OpenRouter 只在显式选择 MAI 中文语音合成或 `openrouter-whisper1` 时使用。不要把 API Key 写进源码或命令行，请通过环境变量提供：
 
 ```bash
 export OPENROUTER_API_KEY='你的新 Key'
@@ -76,6 +134,19 @@ export PATH="$PWD/.venv/bin:$PATH"
 ```bash
 python3 youtube_dub.py 'https://www.youtube.com/watch?v=2cTDRKRQ5oc'
 ```
+
+本地源音色配音默认查找相邻的 `cosyvoice/`、`miniconda-cosyvoice/bin/python` 和 `cosyvoice/pretrained_models/Fun-CosyVoice3-0.5B`。也可配置：
+
+```bash
+python3 youtube_dub.py URL --full \
+  --tts-backend cosyvoice3-source \
+  --cosyvoice-root /path/to/CosyVoice \
+  --cosyvoice-python /path/to/cosyvoice-python \
+  --cosyvoice-model /path/to/Fun-CosyVoice3-0.5B \
+  --cosyvoice-threads 2
+```
+
+每个中文句子会使用同一时间窗的英文原声作为参考，因此多说话人视频无需预先标注角色。模型始终只加载一份并逐句生成，以控制内存。若要改回托管音色，使用 `--tts-backend mai`。
 
 只需一键下载最高质量的独立视频流和独立音频流时，使用 Skill 启动器。它会自动创建 `output/<视频标题>/`，保留原始视频、原始音频和合并文件，支持 `.part` 断点续传，并且不需要 OpenRouter Key 或 Codex CLI：
 
@@ -124,7 +195,7 @@ python3 youtube_dub.py URL --full --workdir output/full \
 python3 youtube_dub.py URL --text-model MODEL_NAME
 ```
 
-英文转录默认使用 3 个并发线程，中文 TTS 和逐句 ffmpeg 对齐默认各使用 4 个。超长视频可分别按 OpenAI/OpenRouter 限流和本机 CPU 情况调整，允许范围均为 `1`–`16`：
+英文转录默认单任务，本地 CosyVoice3 默认 2 个 CPU 计算线程且逐句生成，逐句 ffmpeg 对齐默认 4 个线程。`--tts-workers` 只控制 MAI 后端：
 
 ```bash
 python3 youtube_dub.py URL --full --workdir output/full \

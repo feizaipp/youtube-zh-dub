@@ -1,6 +1,6 @@
 ---
 name: youtube-zh-dub
-description: Download selectable-quality (720p, 1080p, or unrestricted best) separate YouTube video and audio streams, or turn an English YouTube video into a timestamped, corrected, expert-translated Simplified Chinese dub with embedded subtitles. Use whenever the user supplies a YouTube URL after “转录”, asks for YouTube 中文配音/中文翻译视频, requests the complete YouTube-to-Chinese-dub workflow, or asks to download clear/best-quality YouTube video and audio resources.
+description: Download selectable-quality YouTube streams, or turn an English YouTube video into a timestamped Simplified Chinese dub that can clone each source speaker with local Fun-CosyVoice3 and embed subtitles. Use for YouTube 中文配音/中文翻译视频, complete dubbing workflows, or clear/best-quality YouTube downloads.
 ---
 
 # YouTube 中文配音
@@ -9,8 +9,12 @@ Run the verified pipeline through `scripts/run_youtube_zh_dub.py`. Treat the com
 
 ## Execute
 
+For a fresh machine or a different agent environment, read the **“给其他 Agent 的快速部署”**
+section in `README.md` before running the workflow. It defines the required separate
+Skill/CosyVoice environments, a low-memory smoke test, and the exact resume rule.
+
 1. Extract exactly one `youtube.com` or `youtu.be` URL from the request. Reject a missing or non-YouTube URL instead of guessing.
-2. The default English transcription backend is local `faster-whisper` with the `medium.en` model, CPU execution, and INT8 compute. It does not require an API key. A complete dubbed-video run still requires `OPENROUTER_API_KEY` for MAI TTS; the optional `openrouter-whisper1` transcription backend also requires it. Never print the key, put it in a command argument, store it in the Skill, or recover it from chat history/plaintext files. Also require an installed and authenticated `codex` command for English polishing, topic detection, Chinese translation, and timing rewrites.
+2. The defaults are local `faster-whisper medium.en` transcription (CPU INT8) and local `Fun-CosyVoice3-0.5B` source-voice TTS. Neither needs an API key. Require `OPENROUTER_API_KEY` only when `--tts-backend mai` or `--transcriber-backend openrouter-whisper1` is explicitly selected. Never expose or recover the key from plaintext. Also require an authenticated `codex` command for English polishing, topic detection, Chinese translation, and timing rewrites.
 3. Run from any working directory:
 
    ```bash
@@ -32,7 +36,8 @@ The launcher defaults to:
 - One output directory named after the YouTube title: `<skill-directory>/output/<video-title>`.
 - A sanitized title that preserves readable Unicode while replacing filesystem-invalid characters. Append the video ID only if another video already occupies the same title.
 - Maximum post-processing speed-up of `1.15x` and up to five translation-shortening attempts.
-- Bounded concurrency: one local `faster-whisper` `medium.en` transcription task, four MAI TTS workers, and four local ffmpeg fitting workers by default; override with `--transcribe-workers`, `--tts-workers`, and `--fit-workers` when local CPU capacity or rate limits allow.
+- Source-voice synthesis: extract each polished English sentence window from `source_audio.wav` and use it as that Chinese sentence's cross-lingual CosyVoice3 reference, so multi-speaker videos follow the current source speaker without manual voice labels.
+- Memory-bounded local TTS: load one CosyVoice3 model and generate sentences sequentially. Use `--cosyvoice-threads` for CPU compute; do not create concurrent model copies. Four `--tts-workers` apply only to the optional MAI backend.
 - The bundled verified source pipeline at `<skill-directory>/youtube_dub.py`.
 - The project `.venv/bin` prepended to `PATH` when present.
 
@@ -45,6 +50,8 @@ python3 ~/.codex/skills/youtube-zh-dub/scripts/run_youtube_zh_dub.py URL --cooki
 # Explicit alternate output directory.
 python3 ~/.codex/skills/youtube-zh-dub/scripts/run_youtube_zh_dub.py URL --workdir /absolute/output/path
 ```
+
+The local TTS backend discovers `COSYVOICE_ROOT`, `COSYVOICE_PYTHON`, and `COSYVOICE_MODEL`, or accepts the matching `--cosyvoice-root`, `--cosyvoice-python`, and `--cosyvoice-model` options. The default layout is a sibling `cosyvoice/` checkout, `miniconda-cosyvoice/bin/python`, and `cosyvoice/pretrained_models/Fun-CosyVoice3-0.5B`. Use `--tts-backend mai` when local CosyVoice is unavailable or the user explicitly prefers the hosted voice.
 
 ## Debug economically
 
@@ -72,6 +79,7 @@ Use the pipeline defaults unless the user asks otherwise. They enforce these inv
 - Preserve the polished English timestamps exactly in the Chinese transcript.
 - Preserve real inter-sentence silence and fail explicitly if word timestamps are absent; never fall back to word-count/duration interpolation.
 - Trim only leading/trailing TTS silence; preserve internal pauses.
+- Include the exact source-reference WAV hash in each local TTS cache key. Changing source audio, sentence boundaries, Chinese text, backend, or model must regenerate the affected sentence.
 - Shorten only Chinese sentences whose natural speech would exceed the maximum tempo, regenerate only those lines, and never silently fast-forward beyond the cap.
 - Produce H.264/AAC video with an embedded default/forced `mov_text` Chinese subtitle stream compatible with QuickTime.
 - Also produce `dubbed.zh.bilibili.mp4` with Chinese subtitles burned into the H.264 picture so video-platform transcoding cannot discard them; copy the already encoded AAC dub audio without regenerating speech.
