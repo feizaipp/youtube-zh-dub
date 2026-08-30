@@ -63,7 +63,7 @@ cd "$SKILL_DIR"
   'https://youtu.be/dQw4w9WgXcQ' --download-only --dry-run --video-title smoke-test
 ```
 
-然后用明确的 CosyVoice 参数跑 45 秒验证片段。`--cosyvoice-threads 2` 与
+然后用明确的 CosyVoice 参数跑 45 秒验证片段。`--cosyvoice-threads 1` 与
 `--fit-workers 2` 是 8 GiB 内存机器的保守起点；本地 TTS 始终只加载一个模型，
 不要用 `--tts-workers` 增加 CosyVoice 并发。
 
@@ -73,7 +73,7 @@ PATH="$PWD/.venv/bin:$PATH" python3 scripts/run_youtube_zh_dub.py URL \
   --cosyvoice-root "$HOME/CosyVoice" \
   --cosyvoice-python "$(conda run -n cosyvoice which python)" \
   --cosyvoice-model "$HOME/CosyVoice/pretrained_models/Fun-CosyVoice3-0.5B" \
-  --cosyvoice-threads 2 --fit-workers 2
+  --cosyvoice-threads 1 --fit-workers 2
 ```
 
 确认验证目录中已有 `transcript.zh.srt`、`sync_report.json` 和最终视频后，再将

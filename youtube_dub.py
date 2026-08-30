@@ -109,6 +109,39 @@ def run(command: Sequence[str], *, capture: bool = False) -> subprocess.Complete
         raise PipelineError(f"命令执行失败（退出码 {exc.returncode}）：{printable}\n{details}") from exc
 
 
+def cosyvoice_worker_command(command: Sequence[str]) -> list[str]:
+    """Move memory-heavy local TTS out of a capped systemd service when possible.
+
+    Hermes itself can run inside a user systemd service with a lower MemoryMax than
+    the host.  A transient user scope keeps CosyVoice one-shot while letting it use
+    the host capacity.  Ordinary shells and non-systemd hosts retain the direct
+    invocation, and the escape hatch is useful for diagnostics.
+    """
+    if (
+        sys.platform == "linux"
+        and os.environ.get("INVOCATION_ID")
+        and not os.environ.get("YOUTUBE_DUB_DISABLE_SYSTEMD_SCOPE")
+        and shutil.which("systemd-run")
+    ):
+        matplotlib_cache = Path.home() / ".cache" / "matplotlib-cosyvoice"
+        matplotlib_cache.mkdir(parents=True, exist_ok=True)
+        return [
+            "systemd-run",
+            "--user",
+            "--scope",
+            "--collect",
+            "--quiet",
+            "--property=MemoryMax=infinity",
+            f"--setenv=MPLCONFIGDIR={matplotlib_cache}",
+            "--setenv=MALLOC_ARENA_MAX=1",
+            "--setenv=OMP_NUM_THREADS=1",
+            "--setenv=MKL_NUM_THREADS=1",
+            "--setenv=OPENBLAS_NUM_THREADS=1",
+            *command,
+        ]
+    return list(command)
+
+
 def require_tools(args: argparse.Namespace) -> None:
     required = ["yt-dlp", "ffmpeg", "ffprobe"]
     missing = [tool for tool in required if not shutil.which(tool)]
@@ -1643,7 +1676,9 @@ def cosyvoice_paths(args: argparse.Namespace) -> tuple[Path, Path, Path, Path]:
     model_value = args.cosyvoice_model or os.environ.get("COSYVOICE_MODEL")
     model = Path(model_value).expanduser() if model_value else root / "pretrained_models" / "Fun-CosyVoice3-0.5B"
     worker = Path(__file__).resolve().parent / "scripts" / "run_cosyvoice3_source_tts.py"
-    return root.resolve(), python.resolve(), model.resolve(), worker
+    # Keep the interpreter path un-resolved: resolving a venv's bin/python
+    # symlink points at its base interpreter and silently drops venv packages.
+    return root.resolve(), python, model.resolve(), worker
 
 
 def tts_audit_model(args: argparse.Namespace) -> str:
@@ -1719,13 +1754,13 @@ def prepare_cosyvoice3_sources(
         jobs_path = workdir / "segments" / "cosyvoice3_jobs.json"
         write_json(jobs_path, jobs)
         log(f"顺序生成 {len(jobs)} 个源音色 CosyVoice3 片段（单模型实例）")
-        run([
+        run(cosyvoice_worker_command([
             str(python), str(worker),
             "--cosyvoice-root", str(root),
             "--model", str(model),
             "--jobs", str(jobs_path),
             "--threads", str(args.cosyvoice_threads),
-        ])
+        ]))
 
     prepared = {}
     for segment in segments:
@@ -2895,8 +2930,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--cosyvoice-threads",
         type=int,
-        default=2,
-        help="CosyVoice3 CPU 计算线程数；模型始终单实例顺序生成",
+        default=1,
+        help="CosyVoice3 CPU 计算线程数；默认单线程以适配内存受限主机，模型始终单实例顺序生成",
     )
     parser.add_argument(
         "--tts-workers",
