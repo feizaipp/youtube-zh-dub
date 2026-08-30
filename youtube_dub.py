@@ -49,6 +49,11 @@ TEXT_PIPELINE_VERSION = 3
 TIMESTAMP_PIPELINE_VERSION = 1
 ALIGNMENT_PIPELINE_VERSION = 2
 BILIBILI_SUBTITLE_RENDER_VERSION = 2
+BACKGROUND_AUDIO_PIPELINE_VERSION = 1
+DEFAULT_BACKGROUND_MODE = "demucs"
+DEFAULT_DEMUCS_MODEL = "htdemucs"
+DEFAULT_BACKGROUND_VOLUME = 0.7
+DEFAULT_BACKGROUND_DUCK_RATIO = 4.0
 STAGES = ("download", "transcribe", "polish", "translate", "synthesize", "mux")
 QUALITY_VIDEO_FORMATS = {
     "best": "bestvideo",
@@ -2418,12 +2423,196 @@ def synthesize_dub(
     return output
 
 
+def background_source_audio(workdir: Path, video: Path) -> Path:
+    """Use the retained high-quality audio when it matches the active video timeline."""
+    for prefix in ("source", "raw"):
+        candidate = find_standardized_stream(workdir, prefix, "audio")
+        if candidate is None:
+            continue
+        if math.isclose(
+            probe_duration(candidate), probe_duration(video), abs_tol=0.1
+        ):
+            return candidate
+    # Debug clips retain the full downloaded audio separately, so source.mp4 is
+    # the only high-quality input guaranteed to match their shortened timeline.
+    return video
+
+
+def demucs_separation_fingerprint(
+    args: argparse.Namespace, source: Path
+) -> dict[str, Any]:
+    return {
+        "pipeline_version": BACKGROUND_AUDIO_PIPELINE_VERSION,
+        "source_sha256": file_sha256(source),
+        "model": args.demucs_model,
+        "stems": "vocals",
+    }
+
+
+def separate_background_audio(
+    args: argparse.Namespace, workdir: Path, video: Path
+) -> Path:
+    """Separate speech/vocals and cache the remaining background stem."""
+    source = background_source_audio(workdir, video)
+    output = workdir / "background_audio.wav"
+    metadata_path = workdir / "segments" / "demucs_background.json"
+    requested = demucs_separation_fingerprint(args, source)
+    cached = read_json(metadata_path) if metadata_path.exists() else {}
+    if (
+        output.exists()
+        and not args.force
+        and cached.get("request") == requested
+        and cached.get("output_sha256") == file_sha256(output)
+    ):
+        log("复用与原始音频和 Demucs 模型一致的背景声轨")
+        return output
+
+    demucs = shutil.which("demucs")
+    if not demucs:
+        raise PipelineError(
+            "保留背景音乐需要 Demucs。请在项目环境中安装 requirements.txt，"
+            "或使用 --background-mode none 生成纯中文配音。"
+        )
+
+    separation_root = (
+        workdir / "segments" / "demucs" / json_fingerprint(requested)[:12]
+    )
+    separation_root.mkdir(parents=True, exist_ok=True)
+    command = [
+        demucs,
+        "--two-stems",
+        "vocals",
+        "--name",
+        args.demucs_model,
+        "--out",
+        str(separation_root),
+        "--float32",
+    ]
+    if args.demucs_device != "auto":
+        command.extend(["--device", args.demucs_device])
+    command.append(str(source))
+    log(f"使用 Demucs {args.demucs_model} 分离英文人声与背景声")
+    run(command)
+
+    candidates = sorted(separation_root.rglob("no_vocals.wav"))
+    if len(candidates) != 1:
+        found = ", ".join(str(path) for path in candidates) or "无"
+        raise PipelineError(f"Demucs 未生成唯一的 no_vocals.wav；找到：{found}")
+    temporary_output = output.with_name(output.stem + ".tmp" + output.suffix)
+    shutil.copyfile(candidates[0], temporary_output)
+    temporary_output.replace(output)
+    write_json(
+        metadata_path,
+        {
+            "complete": True,
+            "request": requested,
+            "source": str(source),
+            "output": str(output),
+            "output_sha256": file_sha256(output),
+        },
+    )
+    return output
+
+
+def mix_background_with_dub(
+    args: argparse.Namespace,
+    workdir: Path,
+    video: Path,
+    background: Path,
+    dub: Path,
+) -> Path:
+    """Duck the separated background under the Chinese voice and mix both."""
+    output = workdir / "chinese_mix.wav"
+    metadata_path = workdir / "segments" / "chinese_mix.json"
+    duration = probe_duration(video)
+    requested = {
+        "pipeline_version": BACKGROUND_AUDIO_PIPELINE_VERSION,
+        "background_sha256": file_sha256(background),
+        "dub_sha256": file_sha256(dub),
+        "background_volume": args.background_volume,
+        "duck_ratio": args.background_duck_ratio,
+        "duration": round(duration, 6),
+    }
+    cached = read_json(metadata_path) if metadata_path.exists() else {}
+    if (
+        output.exists()
+        and not args.force
+        and cached.get("request") == requested
+        and cached.get("output_sha256") == file_sha256(output)
+    ):
+        log("复用与当前背景声、中文配音和混音参数一致的最终音轨")
+        return output
+
+    filter_graph = (
+        "[0:a]aresample=48000,"
+        "aformat=sample_fmts=fltp:channel_layouts=stereo,"
+        f"volume={args.background_volume:.6f}[background];"
+        "[1:a]aresample=48000,"
+        "aformat=sample_fmts=fltp:channel_layouts=stereo,"
+        "asplit=2[dub_key][dub];"
+        "[background][dub_key]sidechaincompress="
+        f"threshold=0.025:ratio={args.background_duck_ratio:.6f}:"
+        "attack=20:release=350[ducked];"
+        "[ducked][dub]amix=inputs=2:duration=longest:normalize=0,"
+        f"alimiter=limit=0.95,apad=whole_dur={duration:.6f},"
+        f"atrim=duration={duration:.6f}[mixed]"
+    )
+    temporary_output = output.with_name(output.stem + ".tmp" + output.suffix)
+    log("混合 Demucs 背景声与中文配音，并在中文说话时自动压低背景")
+    run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            str(background),
+            "-i",
+            str(dub),
+            "-filter_complex",
+            filter_graph,
+            "-map",
+            "[mixed]",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+            "-c:a",
+            "pcm_s16le",
+            str(temporary_output),
+        ]
+    )
+    temporary_output.replace(output)
+    write_json(
+        metadata_path,
+        {
+            "complete": True,
+            "request": requested,
+            "output": str(output),
+            "output_sha256": file_sha256(output),
+        },
+    )
+    return output
+
+
+def prepare_final_audio(
+    args: argparse.Namespace, workdir: Path, video: Path, dub: Path
+) -> Path:
+    if args.background_mode == "none":
+        log("背景声保留已禁用，使用纯中文配音轨")
+        return dub
+    background = separate_background_audio(args, workdir, video)
+    return mix_background_with_dub(args, workdir, video, background, dub)
+
+
 def mux_video(args: argparse.Namespace, workdir: Path, video: Path, dub: Path) -> Path:
+    final_audio = prepare_final_audio(args, workdir, video, dub)
     output = workdir / "dubbed.zh.mp4"
     subtitle_source = workdir / "transcript.zh.srt"
     remux_requested = args.force or args.remux_only
     if output.exists() and not remux_requested:
-        input_paths = [video, dub]
+        input_paths = [video, final_audio]
         if subtitle_source.exists():
             input_paths.append(subtitle_source)
         newest_input = max(path.stat().st_mtime for path in input_paths)
@@ -2479,7 +2668,7 @@ def mux_video(args: argparse.Namespace, workdir: Path, video: Path, dub: Path) -
         "-i",
         str(video_input),
         "-i",
-        str(dub),
+        str(final_audio),
     ]
     if subtitle.exists():
         command.extend(["-i", str(subtitle)])
@@ -2508,7 +2697,11 @@ def mux_video(args: argparse.Namespace, workdir: Path, video: Path, dub: Path) -
         "-metadata:s:a:0",
         "language=zho",
         "-metadata:s:a:0",
-        "title=中文配音",
+        (
+            "title=中文配音（保留背景声）"
+            if args.background_mode == "demucs"
+            else "title=中文配音"
+        ),
     ])
     if subtitle.exists():
         log("加入 QuickTime 兼容的内嵌中文字幕轨")
@@ -2533,7 +2726,6 @@ def mux_video(args: argparse.Namespace, workdir: Path, video: Path, dub: Path) -
         "+faststart",
         "-max_muxing_queue_size",
         "2048",
-        "-shortest",
         str(temporary_output),
     ])
     run(command)
@@ -2769,6 +2961,35 @@ def build_parser() -> argparse.ArgumentParser:
         help="超时译文的最大自动精简轮数，默认 5",
     )
     parser.add_argument(
+        "--background-mode",
+        choices=("demucs", "none"),
+        default=DEFAULT_BACKGROUND_MODE,
+        help="最终音轨是否用 Demucs 去除英文人声并保留背景声；默认 demucs",
+    )
+    parser.add_argument(
+        "--demucs-model",
+        default=DEFAULT_DEMUCS_MODEL,
+        help="Demucs 分离模型，默认 htdemucs",
+    )
+    parser.add_argument(
+        "--demucs-device",
+        choices=("auto", "cpu", "cuda"),
+        default="auto",
+        help="Demucs 运行设备；默认自动选择",
+    )
+    parser.add_argument(
+        "--background-volume",
+        type=float,
+        default=DEFAULT_BACKGROUND_VOLUME,
+        help="分离后背景声的混音音量，默认 0.7",
+    )
+    parser.add_argument(
+        "--background-duck-ratio",
+        type=float,
+        default=DEFAULT_BACKGROUND_DUCK_RATIO,
+        help="中文说话时压低背景声的压缩比，默认 4.0",
+    )
+    parser.add_argument(
         "--cookies-from-browser",
         help="遇到 YouTube 登录校验时传给 yt-dlp，例如 chrome 或 safari",
     )
@@ -2845,6 +3066,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise PipelineError("--max-tempo 必须在 1.0 到 1.5 之间")
     if not 1 <= args.timing_rewrite_attempts <= 5:
         raise PipelineError("--timing-rewrite-attempts 必须在 1 到 5 之间")
+    if not 0 <= args.background_volume <= 2:
+        raise PipelineError("--background-volume 必须在 0 到 2 之间")
+    if not 1 <= args.background_duck_ratio <= 20:
+        raise PipelineError("--background-duck-ratio 必须在 1 到 20 之间")
     if args.remux_only and args.subtitles_only:
         raise PipelineError("--remux-only 和 --subtitles-only 不能同时使用")
 
@@ -2880,10 +3105,14 @@ def ensure_manifest(args: argparse.Namespace, workdir: Path) -> None:
         "tts_backend": args.tts_backend,
         "tts": tts_audit_model(args),
         "voice": tts_audit_voice(args),
+        "background_mode": args.background_mode,
+        "demucs_model": args.demucs_model if args.background_mode == "demucs" else None,
     }, "execution": {
         "transcribe_workers": args.transcribe_workers,
         "tts_workers": args.tts_workers,
         "fit_workers": args.fit_workers,
+        "background_volume": args.background_volume,
+        "background_duck_ratio": args.background_duck_ratio,
     }})
 
 

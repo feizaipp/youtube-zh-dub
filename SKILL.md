@@ -38,6 +38,7 @@ The launcher defaults to:
 - Maximum post-processing speed-up of `1.15x` and up to five translation-shortening attempts.
 - Source-voice synthesis: extract each polished English sentence window from `source_audio.wav` and use it as that Chinese sentence's cross-lingual CosyVoice3 reference, so multi-speaker videos follow the current source speaker without manual voice labels.
 - Memory-bounded local TTS: load one CosyVoice3 model and generate sentences sequentially. Use `--cosyvoice-threads` for CPU compute; do not create concurrent model copies. Four `--tts-workers` apply only to the optional MAI backend.
+- Background preservation: use local Demucs `htdemucs` to remove the original English vocal stem, then sidechain-duck and mix the remaining stereo background under the Chinese dub. Cache both separation and mixing by content hash. Use `--background-mode none` only when the user explicitly wants the legacy voice-only output or Demucs is unavailable.
 - The bundled verified source pipeline at `<skill-directory>/youtube_dub.py`.
 - The project `.venv/bin` prepended to `PATH` when present.
 
@@ -52,6 +53,8 @@ python3 ~/.codex/skills/youtube-zh-dub/scripts/run_youtube_zh_dub.py URL --workd
 ```
 
 The local TTS backend discovers `COSYVOICE_ROOT`, `COSYVOICE_PYTHON`, and `COSYVOICE_MODEL`, or accepts the matching `--cosyvoice-root`, `--cosyvoice-python`, and `--cosyvoice-model` options. The default layout is a sibling `cosyvoice/` checkout, `miniconda-cosyvoice/bin/python`, and `cosyvoice/pretrained_models/Fun-CosyVoice3-0.5B`. Use `--tts-backend mai` when local CosyVoice is unavailable or the user explicitly prefers the hosted voice.
+
+Background preservation requires the project environment to have `demucs` installed (via `requirements.txt`); its model weights download on first use. If that dependency cannot be installed or the user requests a voice-only result, pass `--background-mode none` explicitly. Do not silently drop background audio after a Demucs failure.
 
 ## Debug economically
 
@@ -82,6 +85,7 @@ Use the pipeline defaults unless the user asks otherwise. They enforce these inv
 - Include the exact source-reference WAV hash in each local TTS cache key. Changing source audio, sentence boundaries, Chinese text, backend, or model must regenerate the affected sentence.
 - Shorten only Chinese sentences whose natural speech would exceed the maximum tempo, regenerate only those lines, and never silently fast-forward beyond the cap.
 - Produce H.264/AAC video with an embedded default/forced `mov_text` Chinese subtitle stream compatible with QuickTime.
+- Build the final AAC track from the high-quality retained source audio, never the 16 kHz mono transcription WAV. Preserve the Demucs background stem at stereo quality and duck it only while Chinese speech is active.
 - Also produce `dubbed.zh.bilibili.mp4` with Chinese subtitles burned into the H.264 picture so video-platform transcoding cannot discard them; copy the already encoded AAC dub audio without regenerating speech.
 - Use `Noto Sans CJK SC` for burned Chinese subtitles and visually inspect a subtitle-bearing frame; install `fonts-noto-cjk` on Debian/Ubuntu if glyphs render as boxes.
 

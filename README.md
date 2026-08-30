@@ -13,6 +13,7 @@
 - 完整配音需要已安装并登录的 Codex CLI；
 - 英文词级转录默认在本地运行 `faster-whisper medium.en`（CPU INT8），无需转录 API 费用；
 - 默认中文配音使用本地 Fun-CosyVoice3-0.5B，并要求可用的 CosyVoice 源码、模型和独立 Python 环境；
+- 默认使用本地 Demucs `htdemucs` 分离英文人声并保留背景音乐；首次使用会下载模型权重；
 - 仅在选择 `--tts-backend mai` 或远程 Whisper 时需要 `OPENROUTER_API_KEY`；
 - 推荐安装 Node.js，供 `yt-dlp` 处理 YouTube JavaScript 校验。
 
@@ -34,6 +35,9 @@ git clone https://github.com/feizaipp/youtube-zh-dub.git \
 cd ~/.codex/skills/youtube-zh-dub
 python3 -m venv .venv
 .venv/bin/python -m pip install -U pip
+# CPU 主机先安装 PyTorch CPU 构建，避免 pip 下载无用的 CUDA 运行库。
+.venv/bin/python -m pip install torch \
+  --index-url https://download.pytorch.org/whl/cpu
 .venv/bin/python -m pip install -r requirements.txt
 
 # 依照 CosyVoice 官方安装说明创建独立环境，并取得 Fun-CosyVoice3-0.5B。
@@ -81,6 +85,8 @@ git clone https://github.com/feizaipp/youtube-zh-dub.git \
   ~/.codex/skills/youtube-zh-dub
 cd ~/.codex/skills/youtube-zh-dub
 python3 -m venv .venv
+.venv/bin/python -m pip install torch \
+  --index-url https://download.pytorch.org/whl/cpu
 .venv/bin/python -m pip install -r requirements.txt
 sudo apt-get install fonts-noto-cjk
 ```
@@ -99,7 +105,7 @@ sudo apt-get install fonts-noto-cjk
 3. 通过本机 Codex CLI 跨越原始切块检查英文语法和 ASR 重复词，再把完整句子按词序对齐回真实词级时间轴；句间原始停顿会被保留；
 4. 通过本机 Codex CLI 识别主题，以领域专家口吻翻译为简体中文，并锁定校对后句子的时间戳；
 5. 默认从每个英文句子的原始时间窗提取参考语音，用单实例 Fun-CosyVoice3 跨语言克隆当前说话人的音色并顺序生成中文；也可选择 MAI-Voice-2；
-6. 超过舒适语速上限的句子会由本机 Codex CLI 自动精简并重新生成，最后用 `ffmpeg` 轻微调速、补静音、替换视频音轨；同时输出带可开关软字幕的通用版，以及把中文字幕烧录进画面的哔哩哔哩上传版。
+6. 超过舒适语速上限的句子会由本机 Codex CLI 自动精简并重新生成；Demucs 从高质量原始音频中移除英文人声，`ffmpeg` 在中文说话时自动压低背景声并与中文配音混合；最后同时输出带可开关软字幕的通用版，以及把中文字幕烧录进画面的哔哩哔哩上传版。
 
 ## 安全设置
 
@@ -125,6 +131,8 @@ codex --version
 
 ```bash
 python3 -m venv .venv
+.venv/bin/python -m pip install torch \
+  --index-url https://download.pytorch.org/whl/cpu
 .venv/bin/python -m pip install -r requirements.txt
 export PATH="$PWD/.venv/bin:$PATH"
 ```
@@ -221,6 +229,19 @@ python3 youtube_dub.py --workdir output/full --remux-only
 `--remux-only` 会忽略 URL 和 `--full`，也不会读取或改写该目录的 `manifest.json`。
 程序会检测源视频编码；H.264 会直接复制，AV1、VP9 等编码会转为 QuickTime 兼容的 H.264/AVC（`avc1`、`yuv420p`）。1080p 全片转码需要一定时间。
 
+默认最终音轨使用 Demucs `htdemucs` 的两轨人声分离模式。分离结果保存为
+`background_audio.wav`，再与 `chinese_voice.wav` 混合成 `chinese_mix.wav`；两步都按
+源文件内容和参数生成缓存指纹，重复执行 `--remux-only` 不会重复分离。可调整背景音量、
+侧链压缩比和运行设备：
+
+```bash
+python3 youtube_dub.py --workdir output/full --remux-only \
+  --demucs-device cpu --background-volume 0.7 --background-duck-ratio 4
+```
+
+若明确需要旧版的纯中文配音轨，可使用 `--background-mode none`。该模式不会调用
+Demucs，也不会保留原视频背景声。
+
 最终视频会自动包含 `transcript.zh.srt`，字幕编码为 QuickTime 支持的 `mov_text/tx3g`，使用 `chi` 语言码、“中文字幕”handler 名称，并标记为默认/强制字幕。为规避 QuickTime 在 0.000 秒不触发首条字幕渲染的问题，内嵌版本只将第一条字幕延后 100 毫秒，其余时间戳不变。若只需给已有视频加入或更新中文字幕，可直接复制音视频轨：
 
 ```bash
@@ -239,6 +260,8 @@ python3 youtube_dub.py --workdir output/full --subtitles-only
 - `transcript.en.polished.json` / `.srt`：跨切块纠错并按完整句子重分段后的英文稿，JSON 同时记录重要修订；
 - `transcript.zh.json` / `.srt`：与校对后英文句子保持相同时间戳的中文稿及主题；JSON 还记录为控制语速进行的逐句精简历史；
 - `chinese_voice.wav`：对齐后的中文音轨；
+- `background_audio.wav`：Demucs 去除英文人声后保留的立体声背景轨；
+- `chinese_mix.wav`：背景轨经过侧链压低后与中文配音混合得到的最终音轨；
 - `sync_report.json`：每段裁剪后自然语音时长、目标时长、最终调速倍率和本轮自动精简记录；
 - `dubbed.zh.mp4`：最终中文配音视频。
 - `dubbed.zh.bilibili.mp4`：中文字幕已烧录进画面的 H.264/AAC 成片，适合直接上传哔哩哔哩；字幕始终可见，不依赖平台识别 MP4 内挂字幕轨。

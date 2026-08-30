@@ -457,6 +457,169 @@ class ConcurrencyTests(unittest.TestCase):
         self.assertEqual(checkpoints[-1], [0, 1, 2, 3])
 
 
+class BackgroundAudioTests(unittest.TestCase):
+    def background_args(self, **overrides):
+        values = {
+            "force": False,
+            "background_mode": "demucs",
+            "demucs_model": "htdemucs",
+            "demucs_device": "cpu",
+            "background_volume": 0.7,
+            "background_duck_ratio": 4.0,
+        }
+        values.update(overrides)
+        return argparse.Namespace(**values)
+
+    def test_parser_enables_demucs_background_by_default(self):
+        args = youtube_dub.build_parser().parse_args([])
+        self.assertEqual(args.background_mode, "demucs")
+        self.assertEqual(args.demucs_model, "htdemucs")
+        self.assertEqual(args.background_volume, 0.7)
+        self.assertEqual(args.background_duck_ratio, 4.0)
+
+    def test_background_source_prefers_matching_retained_audio(self):
+        with tempfile.TemporaryDirectory() as folder:
+            workdir = Path(folder)
+            video = workdir / "source.mp4"
+            retained = workdir / "source_audio_original.webm"
+            video.write_bytes(b"video")
+            retained.write_bytes(b"audio")
+            with mock.patch.object(youtube_dub, "probe_duration", return_value=10.0):
+                result = youtube_dub.background_source_audio(workdir, video)
+        self.assertEqual(result, retained)
+
+    def test_background_source_uses_trimmed_video_when_retained_audio_is_full(self):
+        with tempfile.TemporaryDirectory() as folder:
+            workdir = Path(folder)
+            video = workdir / "source.mp4"
+            retained = workdir / "raw_audio_original.webm"
+            video.write_bytes(b"video")
+            retained.write_bytes(b"audio")
+
+            def duration(path):
+                return 45.0 if path == video else 300.0
+
+            with mock.patch.object(youtube_dub, "probe_duration", side_effect=duration):
+                result = youtube_dub.background_source_audio(workdir, video)
+        self.assertEqual(result, video)
+
+    def test_demucs_background_is_cached_by_source_and_model(self):
+        args = self.background_args()
+        observed: list[list[str]] = []
+        with tempfile.TemporaryDirectory() as folder:
+            workdir = Path(folder)
+            video = workdir / "source.mp4"
+            retained = workdir / "source_audio_original.webm"
+            video.write_bytes(b"video")
+            retained.write_bytes(b"audio")
+
+            def fake_run(command, **_kwargs):
+                observed.append(list(command))
+                output_root = Path(command[command.index("--out") + 1])
+                stem = output_root / "htdemucs" / retained.stem / "no_vocals.wav"
+                stem.parent.mkdir(parents=True)
+                stem.write_bytes(b"background")
+                return mock.Mock()
+
+            with mock.patch.object(
+                youtube_dub, "probe_duration", return_value=10.0
+            ), mock.patch.object(
+                youtube_dub.shutil, "which", return_value="/venv/bin/demucs"
+            ), mock.patch.object(youtube_dub, "run", side_effect=fake_run):
+                first = youtube_dub.separate_background_audio(args, workdir, video)
+                second = youtube_dub.separate_background_audio(args, workdir, video)
+
+            self.assertEqual(first, workdir / "background_audio.wav")
+            self.assertEqual(second, first)
+            self.assertEqual(len(observed), 1)
+            self.assertIn("--two-stems", observed[0])
+            self.assertIn("vocals", observed[0])
+            self.assertIn("--device", observed[0])
+            self.assertEqual(observed[0][-1], str(retained))
+            metadata = youtube_dub.read_json(
+                workdir / "segments" / "demucs_background.json"
+            )
+            self.assertTrue(metadata["complete"])
+            self.assertEqual(metadata["request"]["model"], "htdemucs")
+
+    def test_mix_uses_sidechain_ducking_and_is_cached(self):
+        args = self.background_args()
+        observed: list[list[str]] = []
+        with tempfile.TemporaryDirectory() as folder:
+            workdir = Path(folder)
+            video = workdir / "source.mp4"
+            background = workdir / "background_audio.wav"
+            dub = workdir / "chinese_voice.wav"
+            video.write_bytes(b"video")
+            background.write_bytes(b"background")
+            dub.write_bytes(b"dub")
+
+            def fake_run(command, **_kwargs):
+                observed.append(list(command))
+                Path(command[-1]).write_bytes(b"mixed")
+                return mock.Mock()
+
+            with mock.patch.object(
+                youtube_dub, "probe_duration", return_value=10.0
+            ), mock.patch.object(youtube_dub, "run", side_effect=fake_run):
+                first = youtube_dub.mix_background_with_dub(
+                    args, workdir, video, background, dub
+                )
+                second = youtube_dub.mix_background_with_dub(
+                    args, workdir, video, background, dub
+                )
+
+            self.assertEqual(first, workdir / "chinese_mix.wav")
+            self.assertEqual(second, first)
+            self.assertEqual(len(observed), 1)
+            filter_graph = observed[0][observed[0].index("-filter_complex") + 1]
+            self.assertIn("sidechaincompress=", filter_graph)
+            self.assertIn("amix=inputs=2", filter_graph)
+            self.assertIn("volume=0.700000", filter_graph)
+            self.assertIn("ratio=4.000000", filter_graph)
+
+    def test_none_mode_returns_unmixed_dub(self):
+        args = self.background_args(background_mode="none")
+        dub = Path("chinese_voice.wav")
+        self.assertEqual(
+            youtube_dub.prepare_final_audio(args, Path("work"), Path("video"), dub),
+            dub,
+        )
+
+    def test_mux_does_not_truncate_video_at_last_subtitle(self):
+        args = self.background_args(
+            background_mode="none", force=True, remux_only=True
+        )
+        observed: list[str] = []
+        with tempfile.TemporaryDirectory() as folder:
+            workdir = Path(folder)
+            video = workdir / "source.mp4"
+            dub = workdir / "chinese_voice.wav"
+            subtitle = workdir / "transcript.zh.srt"
+            video.write_bytes(b"video")
+            dub.write_bytes(b"dub")
+            subtitle.write_text(
+                "1\n00:00:00,000 --> 00:00:01,000\n字幕\n", encoding="utf-8"
+            )
+
+            def fake_run(command, **_kwargs):
+                observed.extend(command)
+                Path(command[-1]).write_bytes(b"muxed")
+                return mock.Mock()
+
+            with mock.patch.object(
+                youtube_dub, "prepare_final_audio", return_value=dub
+            ), mock.patch.object(
+                youtube_dub, "probe_video_codec", return_value="h264"
+            ), mock.patch.object(
+                youtube_dub, "run", side_effect=fake_run
+            ), mock.patch.object(youtube_dub, "burn_bilibili_subtitles"):
+                youtube_dub.mux_video(args, workdir, video, dub)
+
+        self.assertNotIn("-shortest", observed)
+        self.assertIn("title=中文配音", observed)
+
+
 class DownloadTests(unittest.TestCase):
     def test_quality_maps_to_height_capped_best_video(self):
         self.assertEqual(
