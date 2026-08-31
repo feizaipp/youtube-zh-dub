@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import unicodedata
+import urllib.error
 import urllib.request
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -79,9 +80,19 @@ def is_download_only(args: argparse.Namespace, passthrough: list[str]) -> bool:
     return args.download_only or option_value(passthrough, "--stop-after") == "download"
 
 
+def is_cover_only(args: argparse.Namespace) -> bool:
+    """Return whether the launcher should download only the video cover image."""
+    return bool(getattr(args, "download_cover", False))
+
+
+def should_download_cover(args: argparse.Namespace) -> bool:
+    """Return whether a normal non-dry-run workflow must retrieve its cover."""
+    return not is_cover_only(args) and not bool(getattr(args, "dry_run", False))
+
+
 def needs_openrouter(args: argparse.Namespace, passthrough: list[str]) -> bool:
     """Return whether the run reaches OpenRouter transcription or synthesis."""
-    if is_download_only(args, passthrough):
+    if is_cover_only(args) or is_download_only(args, passthrough):
         return False
     backend = option_value(passthrough, "--transcriber-backend") or "faster-whisper"
     if backend == "openrouter-whisper1":
@@ -94,7 +105,7 @@ def needs_openrouter(args: argparse.Namespace, passthrough: list[str]) -> bool:
 def safe_directory_name(title: str, video_id: str) -> str:
     normalized = unicodedata.normalize("NFKC", title)
     normalized = re.sub(r'[<>:"/\\|?*\x00-\x1f\x7f]', "-", normalized)
-    normalized = re.sub(r"\s+", " ", normalized).strip(" .")
+    normalized = re.sub(r"\s+", "-", normalized).strip(" .-")
     normalized = re.sub(r"-{2,}", "-", normalized)
     if normalized in {"", ".", ".."}:
         normalized = f"YouTube-{video_id}"
@@ -205,6 +216,45 @@ def build_command(
     return command
 
 
+def cover_candidates(video_id: str) -> list[str]:
+    """Return public YouTube thumbnail URLs from highest to lowest resolution."""
+    base = f"https://i.ytimg.com/vi/{video_id}"
+    return [
+        f"{base}/maxresdefault.jpg",
+        f"{base}/sddefault.jpg",
+        f"{base}/hqdefault.jpg",
+        f"{base}/mqdefault.jpg",
+        f"{base}/default.jpg",
+    ]
+
+
+def download_cover(workdir: Path, video_id: str, force: bool) -> Path:
+    """Download the best available public JPEG thumbnail without fetching media."""
+    destination = workdir / "cover.jpg"
+    if destination.is_file() and not force:
+        print("[youtube-zh-dub] 复用已下载的封面：cover.jpg", flush=True)
+        return destination
+    failures: list[str] = []
+    for url in cover_candidates(video_id):
+        request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                content_type = response.headers.get_content_type()
+                payload = response.read()
+            if not content_type.startswith("image/") or not payload:
+                failures.append(f"{url} 返回 {content_type or '空内容'}")
+                continue
+            temporary = destination.with_suffix(".jpg.tmp")
+            temporary.write_bytes(payload)
+            temporary.replace(destination)
+            print(f"[youtube-zh-dub] 已下载封面：{url}", flush=True)
+            return destination
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as exc:
+            failures.append(f"{url}：{exc}")
+    details = "；".join(failures)
+    raise RuntimeError(f"无法下载 YouTube 封面：{details}")
+
+
 def write_video_metadata(
     workdir: Path,
     title: str,
@@ -260,6 +310,11 @@ def main() -> int:
         help="只下载所选清晰度的独立视频流和最高质量音频流，不调用模型",
     )
     parser.add_argument(
+        "--download-cover",
+        action="store_true",
+        help="仅下载视频封面为 cover.jpg；不下载媒体、不调用配音流程或模型",
+    )
+    parser.add_argument(
         "--quality",
         choices=QUALITY_CHOICES,
         default="best",
@@ -272,6 +327,10 @@ def main() -> int:
     requested_stop = option_value(passthrough, "--stop-after")
     if args.download_only and requested_stop not in (None, "download"):
         parser.error("--download-only 不能与其他 --stop-after 阶段同时使用")
+    if args.download_cover and args.download_only:
+        parser.error("--download-cover 不能与 --download-only 同时使用")
+    if args.download_cover and requested_stop is not None:
+        parser.error("--download-cover 不能与 --stop-after 同时使用")
     try:
         video_id = youtube_video_id(args.url)
         canonical_url = f"https://www.youtube.com/watch?v={video_id}"
@@ -288,11 +347,12 @@ def main() -> int:
             file=sys.stderr,
         )
         return 2
-    required_tools = (
-        ("yt-dlp",)
-        if args.dry_run
-        else ("yt-dlp", "ffmpeg", "ffprobe")
-    )
+    if args.dry_run:
+        required_tools = ("yt-dlp",)
+    elif is_cover_only(args):
+        required_tools = ()
+    else:
+        required_tools = ("yt-dlp", "ffmpeg", "ffprobe")
     missing = [
         name
         for name in required_tools
@@ -324,11 +384,14 @@ def main() -> int:
             )
             workdir = container / "_debug" / debug_name
 
-    command = build_command(args, passthrough, pipeline, workdir, canonical_url)
     if title:
         print(f"[youtube-zh-dub] 视频标题：{title}", flush=True)
     print(f"[youtube-zh-dub] 输出目录：{workdir}", flush=True)
-    print("[youtube-zh-dub] 命令：" + " ".join(command), flush=True)
+    if is_cover_only(args):
+        print("[youtube-zh-dub] 封面源：" + cover_candidates(video_id)[0], flush=True)
+    else:
+        command = build_command(args, passthrough, pipeline, workdir, canonical_url)
+        print("[youtube-zh-dub] 命令：" + " ".join(command), flush=True)
     if args.dry_run:
         return 0
 
@@ -341,6 +404,17 @@ def main() -> int:
         write_video_metadata(
             workdir, title, video_id, canonical_url, args.url, args.quality
         )
+    if is_cover_only(args) or should_download_cover(args):
+        try:
+            cover = download_cover(
+                workdir, video_id, force=has_option(passthrough, "--force")
+            )
+        except RuntimeError as exc:
+            print(f"错误：{exc}", file=sys.stderr)
+            return 1
+        print(f"[youtube-zh-dub] 封面文件：{cover}", flush=True)
+        if is_cover_only(args):
+            return 0
     completed = subprocess.run(command, env=environment)
     return completed.returncode
 

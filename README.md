@@ -151,7 +151,7 @@ python3 youtube_dub.py URL --full \
 
 每个中文句子会使用同一时间窗的英文原声作为参考，因此多说话人视频无需预先标注角色。模型始终只加载一份并逐句生成，以控制内存。若要改回托管音色，使用 `--tts-backend mai`。
 
-只需一键下载最高质量的独立视频流和独立音频流时，使用 Skill 启动器。它会自动创建 `output/<视频标题>/`，保留原始视频、原始音频和合并文件，支持 `.part` 断点续传，并且不需要 OpenRouter Key 或 Agent 文本任务：
+只需一键下载最高质量的独立视频流和独立音频流时，使用 Skill 启动器。它会自动创建 `output/<视频标题>/`：标题中的连续空白会替换为单个 `-`，保留原始视频、原始音频和合并文件，支持 `.part` 断点续传，并且不需要 OpenRouter Key 或 Agent 文本任务：
 
 ```bash
 python3 scripts/run_youtube_zh_dub.py \
@@ -168,6 +168,14 @@ python3 scripts/run_youtube_zh_dub.py URL --download-only --quality 1080p
 ```
 
 `--quality best` 保持不限制清晰度的默认行为。若同一输出目录已经完成另一种清晰度的下载，请使用新的 `--workdir`；只有明确要覆盖旧资源时才使用 `--force`。
+
+只下载视频封面、且不下载音视频、不转录、不调用模型时，使用 `--download-cover`。封面会以 `cover.jpg` 保存在相同的标题输出目录中；该模式直接从 YouTube 公共缩略图端点按最高可用清晰度获取 JPEG，不会启动 `yt-dlp` 媒体下载或配音流程：
+
+```bash
+python3 scripts/run_youtube_zh_dub.py URL --download-cover
+```
+
+可用 `--workdir /absolute/output/path` 指定封面目录；如需重新抓取已有的 `cover.jpg`，明确传入 `--force`。常规的完整配音、调试片段和 `--download-only` 自动化流程也会在进入媒体处理前下载（或复用）同一输出目录内的 `cover.jpg`；`--dry-run` 不执行下载。
 
 调试模式只把指定片段发送给模型。下载阶段通过所选视频清晰度与 `bestaudio` 在同一次 yt-dlp 任务中取得两条流，`--keep-video` 会阻止合并后删除原始流。随后由本地 ffmpeg 从已下载的原始音频生成 WAV，并截取调试片段；不会再向 YouTube 发起第二次音频下载请求。可用 `--video-format` 和 `--audio-format` 分别覆盖两个 yt-dlp 格式选择器。程序会自动读取系统 HTTP(S) 代理，也可显式传入 `--proxy URL`。
 

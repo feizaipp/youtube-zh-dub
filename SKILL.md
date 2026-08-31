@@ -33,11 +33,19 @@ For download-only requests, run the same launcher with `--download-only`. This m
 python3 "$SKILL_DIR/scripts/run_youtube_zh_dub.py" URL --download-only --quality 1080p
 ```
 
+For a cover-only request, run `--download-cover`. It downloads no audio/video, starts no transcription or dubbing stage, and saves the selected YouTube thumbnail as `cover.jpg` in the title-based output directory (or an explicit `--workdir`):
+
+```bash
+python3 "$SKILL_DIR/scripts/run_youtube_zh_dub.py" URL --download-cover
+```
+
+Every non-dry-run normal workflow—including full dubbing, debug clips, and `--download-only`—must also download or reuse `cover.jpg` in its selected output directory before media processing. A cover retrieval failure is a run failure; do not silently omit it. `--dry-run` does not download a cover.
+
 The launcher defaults to:
 
 - Full-video processing with `--full`.
 - One output directory named after the YouTube title: `<skill-directory>/output/<video-title>`.
-- A sanitized title that preserves readable Unicode while replacing filesystem-invalid characters. Append the video ID only if another video already occupies the same title.
+- A sanitized title that preserves readable Unicode while replacing filesystem-invalid characters and converting each run of title whitespace to one `-`. Append the video ID only if another video already occupies the same title.
 - Maximum post-processing speed-up of `1.15x` and up to five translation-shortening attempts.
 - Source-voice synthesis: extract each polished English sentence window from `source_audio.wav` and use it as that Chinese sentence's cross-lingual CosyVoice3 reference, so multi-speaker videos follow the current source speaker without manual voice labels.
 - Memory-bounded local TTS: load one CosyVoice3 model and generate sentences sequentially. Use `--cosyvoice-threads` for CPU compute; do not create concurrent model copies. Four `--tts-workers` apply only to the optional MAI backend.

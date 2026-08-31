@@ -820,6 +820,14 @@ def transcribe_audio(
     duration = probe_duration(audio)
     silences = detect_silence_midpoints(audio)
     boundaries = choose_boundaries(duration, silences, args.chunk_seconds)
+    # Avoid a very short tail ASR job. It is often a silent outro, yet it can
+    # contain a final spoken phrase; merge it into the preceding window so the
+    # ASR still has sufficient context rather than treating empty output as a
+    # fatal transcription error.
+    if len(boundaries) >= 3 and boundaries[-1] - boundaries[-2] < 5.0:
+        tail_start = boundaries[-2]
+        boundaries.pop(-2)
+        log(f"将 {duration - tail_start:.2f} 秒短尾段合并到前一转录片段")
     segment_dir = workdir / "segments" / "english"
     total_segments = len(boundaries) - 1
     completed_by_id: dict[int, Segment] = {}
