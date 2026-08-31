@@ -1,6 +1,6 @@
 ---
 name: youtube-zh-dub
-description: Download selectable-quality YouTube streams, or turn an English YouTube video into a timestamped Simplified Chinese dub that can clone each source speaker with local Fun-CosyVoice3 and embed subtitles. Use for YouTube 中文配音/中文翻译视频, complete dubbing workflows, or clear/best-quality YouTube downloads.
+description: Download selectable-quality YouTube streams, or turn an English YouTube video into a timestamped Simplified Chinese dub using Alibaba Cloud CosyVoice or local source-voice cloning, with embedded subtitles. Use for YouTube 中文配音/中文翻译视频, complete dubbing workflows, or clear/best-quality YouTube downloads.
 ---
 
 # YouTube 中文配音
@@ -11,11 +11,11 @@ Set `SKILL_DIR` to this Skill package's root before using the examples below.
 ## Execute
 
 For a fresh machine or a different agent environment, read the **“给其他 Agent 的快速部署”**
-section in `README.md` before running the workflow. It defines the required separate
-Skill/CosyVoice environments, a low-memory smoke test, and the exact resume rule.
+section in `README.md` before running the workflow. It defines the Alibaba Cloud
+credentials, optional local CosyVoice environment, smoke test, and exact resume rule.
 
 1. Extract exactly one `youtube.com` or `youtu.be` URL from the request. Reject a missing or non-YouTube URL instead of guessing.
-2. The defaults are local `faster-whisper medium.en` transcription (CPU INT8) and local `Fun-CosyVoice3-0.5B` source-voice TTS. Neither needs an API key. Require `OPENROUTER_API_KEY` only when `--tts-backend mai` or `--transcriber-backend openrouter-whisper1` is explicitly selected. Never expose or recover the key from plaintext. English polishing, topic detection, Chinese translation, and timing rewrites are completed by the Agent currently running this Skill, using its own configured backend model; they do not invoke a separate model CLI.
+2. The defaults are local `faster-whisper medium.en` transcription (CPU INT8) and Alibaba Cloud `cosyvoice-v3.5-flash` fixed-voice TTS. Require a Beijing-region `DASHSCOPE_API_KEY` plus a matching cloned/designed voice through `ALIYUN_COSYVOICE_VOICE` or `--voice`. Use `DASHSCOPE_WORKSPACE_ID` for the preferred workspace endpoint; the compatible shared Beijing endpoint is used when it is absent. Require `OPENROUTER_API_KEY` only when `--tts-backend mai` or `--transcriber-backend openrouter-whisper1` is selected. Never expose, recover, log, or place API keys on the command line. English polishing, topic detection, Chinese translation, and timing rewrites are completed by the Agent currently running this Skill, using its own configured backend model; they do not invoke a separate model CLI.
 3. Run from any working directory:
 
    ```bash
@@ -47,8 +47,8 @@ The launcher defaults to:
 - One output directory named after the YouTube title: `<skill-directory>/output/<video-title>`.
 - A sanitized title that preserves readable Unicode while replacing filesystem-invalid characters and converting each run of title whitespace to one `-`. Append the video ID only if another video already occupies the same title.
 - Maximum post-processing speed-up of `1.15x` and up to five translation-shortening attempts.
-- Source-voice synthesis: extract each polished English sentence window from `source_audio.wav` and use it as that Chinese sentence's cross-lingual CosyVoice3 reference, so multi-speaker videos follow the current source speaker without manual voice labels.
-- Memory-bounded local TTS: load one CosyVoice3 model and generate sentences sequentially. Use `--cosyvoice-threads` for CPU compute; do not create concurrent model copies. Four `--tts-workers` apply only to the optional MAI backend.
+- Fixed hosted voice synthesis: synthesize each Chinese sentence with `cosyvoice-v3.5-flash`, download its expiring result URL immediately, and cache the local 24 kHz WAV by text, model, voice, speed, and instruction.
+- Bounded hosted concurrency: use four `--tts-workers` by default. Successful sentences remain cached after partial API failures, so rerun unchanged and do not add `--force`.
 - Background preservation: use local Demucs `htdemucs` to remove the original English vocal stem, then sidechain-duck and mix the remaining stereo background under the Chinese dub. Cache both separation and mixing by content hash. Use `--background-mode none` only when the user explicitly wants the legacy voice-only output or Demucs is unavailable.
 - The bundled verified source pipeline at `<skill-directory>/youtube_dub.py`.
 - The project `.venv/bin` prepended to `PATH` when present.
@@ -63,7 +63,9 @@ python3 "$SKILL_DIR/scripts/run_youtube_zh_dub.py" URL --cookies-from-browser ch
 python3 "$SKILL_DIR/scripts/run_youtube_zh_dub.py" URL --workdir /absolute/output/path
 ```
 
-The local TTS backend discovers `COSYVOICE_ROOT`, `COSYVOICE_PYTHON`, and `COSYVOICE_MODEL`, or accepts the matching `--cosyvoice-root`, `--cosyvoice-python`, and `--cosyvoice-model` options. The default layout is a sibling `cosyvoice/` checkout, `miniconda-cosyvoice/bin/python`, and `cosyvoice/pretrained_models/Fun-CosyVoice3-0.5B`. Use `--tts-backend mai` when local CosyVoice is unavailable or the user explicitly prefers the hosted voice.
+Use `--tts-backend cosyvoice3-source` to opt back into per-sentence local source-voice cloning. That backend discovers `COSYVOICE_ROOT`, `COSYVOICE_PYTHON`, and `COSYVOICE_MODEL`, or accepts the matching command options. Its default layout is a sibling `cosyvoice/` checkout, `miniconda-cosyvoice/bin/python`, and `cosyvoice/pretrained_models/Fun-CosyVoice3-0.5B`.
+
+When Alibaba Cloud voice enrollment needs a public sample URL and the user has authorized this host's Nginx endpoint, publish only the final 16-bit WAV with `scripts/nginx_voice_sample.py publish`. Use the returned URL immediately, revoke it after enrollment reaches `OK`, and retain only the resulting `voice_id` in the run registry. Never publish samples under the general `/home/hermes/data` download root. The IP-only endpoint is unencrypted HTTP; disclose that limitation and prefer private OSS or trusted HTTPS when available.
 
 Background preservation requires the project environment to have `demucs` installed (via `requirements.txt`); its model weights download on first use. If that dependency cannot be installed or the user requests a voice-only result, pass `--background-mode none` explicitly. Do not silently drop background audio after a Demucs failure.
 
@@ -93,7 +95,7 @@ Use the pipeline defaults unless the user asks otherwise. They enforce these inv
 - Preserve the polished English timestamps exactly in the Chinese transcript.
 - Preserve real inter-sentence silence and fail explicitly if word timestamps are absent; never fall back to word-count/duration interpolation.
 - Trim only leading/trailing TTS silence; preserve internal pauses.
-- Include the exact source-reference WAV hash in each local TTS cache key. Changing source audio, sentence boundaries, Chinese text, backend, or model must regenerate the affected sentence.
+- Include the hosted voice ID and synthesis controls in Alibaba Cloud cache keys; include the exact source-reference WAV hash for the optional local backend. Changing Chinese text, backend, model, voice, or relevant reference audio must regenerate the affected sentence.
 - Shorten only Chinese sentences whose natural speech would exceed the maximum tempo, regenerate only those lines, and never silently fast-forward beyond the cap.
 - Produce H.264/AAC video with an embedded default/forced `mov_text` Chinese subtitle stream compatible with QuickTime.
 - Build the final AAC track from the high-quality retained source audio, never the 16 kHz mono transcription WAV. Preserve the Demucs background stem at stereo quality and duck it only while Chinese speech is active.

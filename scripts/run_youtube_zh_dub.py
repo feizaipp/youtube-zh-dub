@@ -98,8 +98,17 @@ def needs_openrouter(args: argparse.Namespace, passthrough: list[str]) -> bool:
     if backend == "openrouter-whisper1":
         return True
     stop_after = option_value(passthrough, "--stop-after") or "mux"
-    tts_backend = option_value(passthrough, "--tts-backend") or "cosyvoice3-source"
+    tts_backend = option_value(passthrough, "--tts-backend") or "aliyun-cosyvoice"
     return tts_backend == "mai" and stop_after in {"synthesize", "mux"}
+
+
+def needs_dashscope(args: argparse.Namespace, passthrough: list[str]) -> bool:
+    """Return whether the run reaches Alibaba Cloud speech synthesis."""
+    if is_cover_only(args) or is_download_only(args, passthrough):
+        return False
+    stop_after = option_value(passthrough, "--stop-after") or "mux"
+    tts_backend = option_value(passthrough, "--tts-backend") or "aliyun-cosyvoice"
+    return tts_backend == "aliyun-cosyvoice" and stop_after in {"synthesize", "mux"}
 
 
 def safe_directory_name(title: str, video_id: str) -> str:
@@ -347,6 +356,22 @@ def main() -> int:
             file=sys.stderr,
         )
         return 2
+    if not args.dry_run and needs_dashscope(args, passthrough):
+        if not environment.get("DASHSCOPE_API_KEY"):
+            print(
+                "错误：请先通过环境变量 DASHSCOPE_API_KEY 提供华北2（北京）地域的百炼 API Key。",
+                file=sys.stderr,
+            )
+            return 2
+        if not (
+            environment.get("ALIYUN_COSYVOICE_VOICE")
+            or option_value(passthrough, "--voice")
+        ):
+            print(
+                "错误：请通过 ALIYUN_COSYVOICE_VOICE 或 --voice 提供与 cosyvoice-v3.5-flash 绑定的 voice_id。",
+                file=sys.stderr,
+            )
+            return 2
     if args.dry_run:
         required_tools = ("yt-dlp",)
     elif is_cover_only(args):

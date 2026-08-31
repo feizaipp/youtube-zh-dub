@@ -220,7 +220,7 @@ class ConcurrencyTests(unittest.TestCase):
         self.assertEqual(args.transcriber_backend, "faster-whisper")
         self.assertEqual(args.transcriber_model, "medium.en")
         self.assertEqual(args.transcribe_workers, 1)
-        self.assertEqual(args.tts_backend, "cosyvoice3-source")
+        self.assertEqual(args.tts_backend, "aliyun-cosyvoice")
         self.assertEqual(args.tts_workers, 4)
         self.assertEqual(args.fit_workers, 4)
 
@@ -326,6 +326,91 @@ class ConcurrencyTests(unittest.TestCase):
 
         self.assertGreaterEqual(maximum_active, 2)
         self.assertEqual(sorted(prepared), [0, 1, 2, 3])
+
+    def test_aliyun_cosyvoice_request_uses_fixed_voice_and_downloads_wav(self):
+        args = argparse.Namespace(
+            tts_backend="aliyun-cosyvoice",
+            tts_model=youtube_dub.DEFAULT_TTS,
+            voice="cosyvoice-v3.5-flash-demo-123456",
+            tts_speed=1.0,
+            dashscope_base_url="https://workspace.example/api/v1",
+            aliyun_instruction="自然、清晰地表达。",
+        )
+        audio = b"RIFF" + b"audio" * 30
+        response_document = {
+            "request_id": "request-1",
+            "output": {
+                "audio": {"url": "https://result.example/audio.wav"}
+            },
+        }
+
+        class FakeResponse:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return self.payload
+
+        responses = [
+            FakeResponse(json.dumps(response_document).encode("utf-8")),
+            FakeResponse(audio),
+        ]
+        with mock.patch.dict(os.environ, {"DASHSCOPE_API_KEY": "secret"}), mock.patch.object(
+            youtube_dub.urllib.request, "urlopen", side_effect=responses
+        ) as urlopen:
+            result = youtube_dub.aliyun_cosyvoice_request(args, "测试中文。")
+
+        self.assertEqual(result, audio)
+        request = urlopen.call_args_list[0].args[0]
+        self.assertEqual(
+            request.full_url,
+            "https://workspace.example/api/v1/services/audio/tts/SpeechSynthesizer",
+        )
+        payload = json.loads(request.data.decode("utf-8"))
+        self.assertEqual(payload["model"], "cosyvoice-v3.5-flash")
+        self.assertEqual(payload["input"]["voice"], args.voice)
+        self.assertEqual(payload["input"]["sample_rate"], 24000)
+        self.assertEqual(payload["input"]["instruction"], args.aliyun_instruction)
+
+    def test_aliyun_tts_source_is_cached_as_wav(self):
+        args = argparse.Namespace(
+            tts_backend="aliyun-cosyvoice",
+            tts_model=youtube_dub.DEFAULT_TTS,
+            voice="cosyvoice-v3.5-flash-demo-123456",
+            tts_speed=1.0,
+            aliyun_instruction=None,
+        )
+        segment = youtube_dub.Segment(0, 0.0, 2.0, "测试中文。")
+        with tempfile.TemporaryDirectory() as folder, mock.patch.object(
+            youtube_dub, "aliyun_cosyvoice_request", return_value=b"RIFF" + b"x" * 200
+        ) as request, mock.patch.object(
+            youtube_dub, "trim_tts_edge_silence"
+        ) as trim, mock.patch.object(
+            youtube_dub, "probe_duration", return_value=1.2
+        ):
+            root = Path(folder)
+            raw_dir = root / "raw"
+            trimmed_dir = root / "trimmed"
+            raw_dir.mkdir()
+            trimmed_dir.mkdir()
+
+            def fake_trim(_source, destination):
+                destination.write_bytes(b"trimmed")
+
+            trim.side_effect = fake_trim
+            prepared = youtube_dub.ensure_tts_source(
+                args, segment, raw_dir, trimmed_dir
+            )
+
+        request.assert_called_once_with(args, segment.text)
+        self.assertEqual(prepared[1], 1.2)
+        self.assertEqual(prepared[0].suffix, ".wav")
 
     def test_cosyvoice_source_backend_batches_jobs_and_hashes_references(self):
         args = argparse.Namespace(

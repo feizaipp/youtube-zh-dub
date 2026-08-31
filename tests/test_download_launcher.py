@@ -101,6 +101,8 @@ class SkillLauncherTests(unittest.TestCase):
                         "https://youtu.be/XjSJ6ybS9I8",
                         "--workdir",
                         str(workdir),
+                        "--tts-backend",
+                        "cosyvoice3-source",
                     ],
                 ),
             ):
@@ -129,13 +131,36 @@ class SkillLauncherTests(unittest.TestCase):
         ]
         self.assertTrue(launcher.needs_openrouter(args, passthrough))
 
-    def test_default_source_voice_pipeline_does_not_require_openrouter(self):
+    def test_default_aliyun_pipeline_does_not_require_openrouter(self):
         args = argparse.Namespace(download_only=False)
         self.assertFalse(launcher.needs_openrouter(args, []))
+
+    def test_default_pipeline_requires_dashscope(self):
+        args = argparse.Namespace(download_only=False, download_cover=False)
+        self.assertTrue(launcher.needs_dashscope(args, []))
 
     def test_mai_pipeline_requires_openrouter(self):
         args = argparse.Namespace(download_only=False)
         self.assertTrue(launcher.needs_openrouter(args, ["--tts-backend", "mai"]))
+
+    def test_aliyun_pipeline_requires_dashscope_only_when_synthesizing(self):
+        args = argparse.Namespace(download_only=False, download_cover=False)
+        self.assertTrue(
+            launcher.needs_dashscope(
+                args, ["--tts-backend", "aliyun-cosyvoice"]
+            )
+        )
+        self.assertFalse(
+            launcher.needs_dashscope(
+                args,
+                [
+                    "--tts-backend",
+                    "aliyun-cosyvoice",
+                    "--stop-after",
+                    "translate",
+                ],
+            )
+        )
 
 
 if __name__ == "__main__":

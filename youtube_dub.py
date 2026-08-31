@@ -21,6 +21,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
@@ -29,12 +30,14 @@ from typing import Any, Callable, Iterable, Sequence
 
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+DASHSCOPE_DEFAULT_BASE_URL = "https://dashscope.aliyuncs.com/api/v1"
+DEFAULT_ALIYUN_TTS = "cosyvoice-v3.5-flash"
 DEFAULT_URL = "https://www.youtube.com/watch?v=2cTDRKRQ5oc"
 DEFAULT_TRANSCRIBER = "medium.en"
 DEFAULT_TRANSCRIBER_BACKEND = "faster-whisper"
 DEFAULT_WHISPER_DEVICE = "cpu"
 DEFAULT_WHISPER_COMPUTE_TYPE = "int8"
-DEFAULT_TTS_BACKEND = "cosyvoice3-source"
+DEFAULT_TTS_BACKEND = "aliyun-cosyvoice"
 DEFAULT_TTS = "microsoft/mai-voice-2"
 DEFAULT_VOICE = "zh-CN-Mei:MAI-Voice-2"
 DEFAULT_TRANSCRIBE_WORKERS = 1
@@ -304,6 +307,126 @@ def require_openrouter_api_key(purpose: str) -> str:
         f"{purpose}需要 OPENROUTER_API_KEY 环境变量。该 Key 只用于 MAI 转录或语音合成，"
         "不会用于英文校对、主题识别、中文翻译或超时译文精简。"
     )
+
+
+def require_dashscope_api_key() -> str:
+    api_key = os.environ.get("DASHSCOPE_API_KEY")
+    if api_key:
+        return api_key
+    raise PipelineError(
+        "阿里云 CosyVoice 语音合成需要 DASHSCOPE_API_KEY 环境变量；"
+        "请使用华北2（北京）地域的百炼 API Key。"
+    )
+
+
+def aliyun_tts_model(args: argparse.Namespace) -> str:
+    """Resolve the hosted model without changing the MAI backend's old default."""
+    if args.tts_model == DEFAULT_TTS:
+        return DEFAULT_ALIYUN_TTS
+    return args.tts_model
+
+
+def aliyun_tts_voice(args: argparse.Namespace, *, required: bool = True) -> str:
+    configured = os.environ.get("ALIYUN_COSYVOICE_VOICE")
+    if args.voice != DEFAULT_VOICE:
+        configured = args.voice
+    if configured:
+        return configured
+    if not required:
+        return "not-configured"
+    raise PipelineError(
+        "cosyvoice-v3.5-flash 不提供系统音色。请通过 --voice 或环境变量 "
+        "ALIYUN_COSYVOICE_VOICE 提供与该模型绑定的声音复刻/设计 voice_id。"
+    )
+
+
+def dashscope_base_url(args: argparse.Namespace) -> str:
+    explicit = getattr(args, "dashscope_base_url", None) or os.environ.get(
+        "DASHSCOPE_BASE_URL"
+    )
+    if explicit:
+        return explicit.rstrip("/")
+    workspace_id = os.environ.get("DASHSCOPE_WORKSPACE_ID")
+    if workspace_id:
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", workspace_id):
+            raise PipelineError("DASHSCOPE_WORKSPACE_ID 格式不正确")
+        return f"https://{workspace_id}.cn-beijing.maas.aliyuncs.com/api/v1"
+    return DASHSCOPE_DEFAULT_BASE_URL
+
+
+def aliyun_cosyvoice_request(
+    args: argparse.Namespace,
+    text: str,
+    *,
+    attempts: int = 4,
+    timeout_seconds: float = 120,
+) -> bytes:
+    """Synthesize one sentence and immediately download the expiring result URL."""
+    api_key = require_dashscope_api_key()
+    payload: dict[str, Any] = {
+        "model": aliyun_tts_model(args),
+        "input": {
+            "text": text,
+            "voice": aliyun_tts_voice(args),
+            "format": "wav",
+            "sample_rate": 24000,
+            "rate": args.tts_speed,
+        },
+    }
+    instruction = getattr(args, "aliyun_instruction", None)
+    if instruction:
+        payload["input"]["instruction"] = instruction
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    endpoint = dashscope_base_url(args) + "/services/audio/tts/SpeechSynthesizer"
+    retryable = (408, 409, 429, 500, 502, 503, 504)
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        request = urllib.request.Request(
+            endpoint,
+            data=body,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+                document = json.loads(response.read().decode("utf-8"))
+            audio_url = document.get("output", {}).get("audio", {}).get("url")
+            if not audio_url:
+                message = document.get("message") or document.get("code") or document
+                raise PipelineError(f"阿里云 CosyVoice 未返回音频 URL：{message}")
+            if urllib.parse.urlparse(str(audio_url)).scheme not in {"http", "https"}:
+                raise PipelineError("阿里云 CosyVoice 返回了不支持的音频 URL")
+            with urllib.request.urlopen(str(audio_url), timeout=timeout_seconds) as response:
+                audio = response.read()
+            if len(audio) < 100:
+                raise PipelineError("阿里云 CosyVoice 返回的音频数据过短")
+            return audio
+        except urllib.error.HTTPError as exc:
+            error_body = exc.read().decode("utf-8", errors="replace")
+            last_error = PipelineError(
+                f"阿里云 CosyVoice HTTP {exc.code}: {error_body[:2000]}"
+            )
+            if exc.code not in retryable:
+                break
+        except (
+            urllib.error.URLError,
+            TimeoutError,
+            ConnectionError,
+            http.client.HTTPException,
+            json.JSONDecodeError,
+            PipelineError,
+        ) as exc:
+            last_error = exc
+            if isinstance(exc, PipelineError):
+                break
+        if attempt < attempts:
+            delay = 2 ** (attempt - 1)
+            log(f"阿里云 TTS 请求失败，{delay} 秒后重试（{attempt}/{attempts}）")
+            time.sleep(delay)
+    raise PipelineError(f"阿里云 CosyVoice 请求失败：{last_error}")
 
 
 def yt_dlp_common(args: argparse.Namespace) -> list[str]:
@@ -1653,14 +1776,29 @@ def translation_character_count(text: str) -> int:
 
 
 def tts_cache_key(args: argparse.Namespace, text: str) -> str:
+    model = (
+        aliyun_tts_model(args)
+        if args.tts_backend == "aliyun-cosyvoice"
+        else args.tts_model
+    )
+    voice = (
+        aliyun_tts_voice(args)
+        if args.tts_backend == "aliyun-cosyvoice"
+        else args.voice
+    )
     return hashlib.sha256(
         json.dumps(
             {
                 "text": text,
                 "backend": args.tts_backend,
-                "model": args.tts_model,
-                "voice": args.voice,
+                "model": model,
+                "voice": voice,
                 "speed": args.tts_speed,
+                "instruction": (
+                    getattr(args, "aliyun_instruction", None)
+                    if args.tts_backend == "aliyun-cosyvoice"
+                    else None
+                ),
             },
             ensure_ascii=False,
             sort_keys=True,
@@ -1692,12 +1830,16 @@ def cosyvoice_paths(args: argparse.Namespace) -> tuple[Path, Path, Path, Path]:
 def tts_audit_model(args: argparse.Namespace) -> str:
     if args.tts_backend == "cosyvoice3-source":
         return cosyvoice_paths(args)[2].name
+    if args.tts_backend == "aliyun-cosyvoice":
+        return aliyun_tts_model(args)
     return args.tts_model
 
 
 def tts_audit_voice(args: argparse.Namespace) -> str:
     if args.tts_backend == "cosyvoice3-source":
         return "per-segment source voice reference"
+    if args.tts_backend == "aliyun-cosyvoice":
+        return aliyun_tts_voice(args, required=False)
     return args.voice
 
 
@@ -1822,7 +1964,8 @@ def ensure_tts_source(
     force: bool = False,
 ) -> tuple[Path, float, str]:
     cache_key = tts_cache_key(args, segment.text)
-    raw = raw_dir / f"segment_{segment.id:04d}_{cache_key}.mp3"
+    raw_suffix = ".wav" if args.tts_backend == "aliyun-cosyvoice" else ".mp3"
+    raw = raw_dir / f"segment_{segment.id:04d}_{cache_key}{raw_suffix}"
     trimmed = trimmed_dir / f"segment_{segment.id:04d}_{cache_key}_trim_v1.wav"
     # Very short acknowledgement slots can be shorter than the TTS model's
     # minimum utterance.  Rewriting a one-character filler cannot make it any
@@ -1846,20 +1989,23 @@ def ensure_tts_source(
         return trimmed, segment.duration, cache_key
     if not raw.exists() or force:
         log(f"调用 TTS：句子 {segment.id + 1}")
-        api_key = require_openrouter_api_key("MAI 中文语音合成")
-        audio_bytes = openrouter_request(
-            "audio/speech",
-            api_key,
-            {
-                "model": args.tts_model,
-                "input": segment.text,
-                "voice": args.voice,
-                "response_format": "mp3",
-                "speed": args.tts_speed,
-            },
-            expect_binary=True,
-            timeout_seconds=90,
-        )
+        if args.tts_backend == "aliyun-cosyvoice":
+            audio_bytes = aliyun_cosyvoice_request(args, segment.text)
+        else:
+            api_key = require_openrouter_api_key("MAI 中文语音合成")
+            audio_bytes = openrouter_request(
+                "audio/speech",
+                api_key,
+                {
+                    "model": args.tts_model,
+                    "input": segment.text,
+                    "voice": args.voice,
+                    "response_format": "mp3",
+                    "speed": args.tts_speed,
+                },
+                expect_binary=True,
+                timeout_seconds=90,
+            )
         assert isinstance(audio_bytes, bytes)
         if len(audio_bytes) < 100:
             raise PipelineError(f"TTS 片段 {segment.id} 返回的数据过短")
@@ -2925,13 +3071,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--tts-backend",
-        choices=("cosyvoice3-source", "mai"),
+        choices=("cosyvoice3-source", "aliyun-cosyvoice", "mai"),
         default=DEFAULT_TTS_BACKEND,
-        help="中文 TTS 后端；默认用源片段作为 Fun-CosyVoice3 参考音色",
+        help="中文 TTS 后端；默认使用阿里云 cosyvoice-v3.5-flash 固定音色",
     )
     parser.add_argument("--tts-model", default=DEFAULT_TTS)
     parser.add_argument("--voice", default=DEFAULT_VOICE)
     parser.add_argument("--tts-speed", type=float, default=1.0)
+    parser.add_argument(
+        "--dashscope-base-url",
+        help="阿里云百炼 API 根地址；默认由 DASHSCOPE_WORKSPACE_ID 生成北京专属地址",
+    )
+    parser.add_argument(
+        "--aliyun-instruction",
+        help="可选的 CosyVoice free-style 合成指令",
+    )
     parser.add_argument("--cosyvoice-root", type=Path)
     parser.add_argument("--cosyvoice-python", type=Path)
     parser.add_argument("--cosyvoice-model", type=Path)
