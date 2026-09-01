@@ -43,10 +43,50 @@ class SkillLauncherTests(unittest.TestCase):
         self.assertTrue(launcher.is_cover_only(args))
         self.assertFalse(launcher.needs_openrouter(args, []))
 
+    def test_prepare_environment_loads_parent_dashscope_secrets(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary)
+            project = parent / "youtube-zh-dub"
+            project.mkdir()
+            secrets = parent / ".secrets"
+            secrets.mkdir()
+            (secrets / "dashscope.env").write_text(
+                "DASHSCOPE_API_KEY='test-key'\n"
+                "ALIYUN_COSYVOICE_VOICE=cosyvoice-v3.5-flash-test\n",
+                encoding="utf-8",
+            )
+            with mock.patch.dict(
+                launcher.os.environ,
+                {
+                    "DASHSCOPE_API_KEY": "",
+                    "ALIYUN_COSYVOICE_VOICE": "",
+                },
+                clear=False,
+            ):
+                environment = launcher.prepare_environment(project)
+
+            self.assertEqual(environment["DASHSCOPE_API_KEY"], "test-key")
+            self.assertEqual(
+                environment["ALIYUN_COSYVOICE_VOICE"],
+                "cosyvoice-v3.5-flash-test",
+            )
+
     def test_title_directory_replaces_whitespace_with_hyphens(self):
         self.assertEqual(
             launcher.safe_directory_name("My  Video\tTitle", "XjSJ6ybS9I8"),
             "My-Video-Title",
+        )
+
+    def test_title_directory_removes_special_characters(self):
+        self.assertEqual(
+            launcher.safe_directory_name(
+                "Create Slides, Docs, and Templates", "syML5KT-HzI"
+            ),
+            "Create-Slides-Docs-and-Templates",
+        )
+        self.assertEqual(
+            launcher.safe_directory_name("AI：从入门，到实践！", "example"),
+            "AI从入门到实践",
         )
 
     def test_cover_candidates_prefer_maximum_resolution(self):

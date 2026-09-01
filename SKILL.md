@@ -15,7 +15,7 @@ section in `README.md` before running the workflow. It defines the Alibaba Cloud
 credentials, optional local CosyVoice environment, smoke test, and exact resume rule.
 
 1. Extract exactly one `youtube.com` or `youtu.be` URL from the request. Reject a missing or non-YouTube URL instead of guessing.
-2. The defaults are local `faster-whisper medium.en` transcription (CPU INT8) and Alibaba Cloud `cosyvoice-v3.5-flash` fixed-voice TTS. Require a Beijing-region `DASHSCOPE_API_KEY` plus a matching cloned/designed voice through `ALIYUN_COSYVOICE_VOICE` or `--voice`. Use `DASHSCOPE_WORKSPACE_ID` for the preferred workspace endpoint; the compatible shared Beijing endpoint is used when it is absent. Require `OPENROUTER_API_KEY` only when `--tts-backend mai` or `--transcriber-backend openrouter-whisper1` is selected. Never expose, recover, log, or place API keys on the command line. English polishing, topic detection, Chinese translation, and timing rewrites are completed by the Agent currently running this Skill, using its own configured backend model; they do not invoke a separate model CLI.
+2. The defaults are local `faster-whisper medium.en` transcription (CPU INT8) and Alibaba Cloud `cosyvoice-v3.5-flash` fixed-voice TTS. Require a Beijing-region `DASHSCOPE_API_KEY` plus a matching cloned/designed voice through `ALIYUN_COSYVOICE_VOICE` or `--voice`. The launcher safely loads those variables from `.secrets/dashscope.env` in the Skill directory or its parent when they are absent from the process environment; only DashScope key, workspace, and voice variables are accepted from that file. Use `DASHSCOPE_WORKSPACE_ID` for the preferred workspace endpoint; the compatible shared Beijing endpoint is used when it is absent. Require `OPENROUTER_API_KEY` only when `--tts-backend mai` or `--transcriber-backend openrouter-whisper1` is selected. Never expose, recover, log, or place API keys on the command line. English polishing, topic detection, Chinese translation, and timing rewrites are completed by the Agent currently running this Skill, using its own configured backend model; they do not invoke a separate model CLI.
 3. Run from any working directory:
 
    ```bash
@@ -45,7 +45,7 @@ The launcher defaults to:
 
 - Full-video processing with `--full`.
 - One output directory named after the YouTube title: `<skill-directory>/output/<video-title>`.
-- A sanitized title that preserves readable Unicode while replacing filesystem-invalid characters and converting each run of title whitespace to one `-`. Append the video ID only if another video already occupies the same title.
+- A sanitized title that preserves Unicode letters and numbers, removes punctuation and symbols, and converts each run of title whitespace to one `-`. Append the video ID only if another video already occupies the same title.
 - Maximum post-processing speed-up of `1.15x` and up to five translation-shortening attempts.
 - Fixed hosted voice synthesis: synthesize each Chinese sentence with `cosyvoice-v3.5-flash`, download its expiring result URL immediately, and cache the local 24 kHz WAV by text, model, voice, speed, and instruction.
 - Bounded hosted concurrency: use four `--tts-workers` by default. Successful sentences remain cached after partial API failures, so rerun unchanged and do not add `--force`.

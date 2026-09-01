@@ -40,7 +40,8 @@ python3 -m venv .venv
   --index-url https://download.pytorch.org/whl/cpu
 .venv/bin/python -m pip install -r requirements.txt
 
-# 默认阿里云后端：只在当前 shell 中设置，不写入仓库。
+# 默认阿里云后端：可在当前 shell 中设置，或保存到 Skill 目录/父目录下
+# 权限为 0600 的 .secrets/dashscope.env；该目录已被 .gitignore 排除。
 export DASHSCOPE_API_KEY='北京地域的百炼 API Key'
 export DASHSCOPE_WORKSPACE_ID='业务空间 ID'
 export ALIYUN_COSYVOICE_VOICE='cosyvoice-v3.5-flash-...'
@@ -211,7 +212,7 @@ python3 youtube_dub.py URL --full \
 
 本地后端的每个中文句子会使用同一时间窗的英文原声作为参考，因此多说话人视频无需预先标注角色。模型始终只加载一份并逐句生成，以控制内存。
 
-只需一键下载最高质量的独立视频流和独立音频流时，使用 Skill 启动器。它会自动创建 `output/<视频标题>/`：标题中的连续空白会替换为单个 `-`，保留原始视频、原始音频和合并文件，支持 `.part` 断点续传，并且不需要 OpenRouter Key 或 Agent 文本任务：
+只需一键下载最高质量的独立视频流和独立音频流时，使用 Skill 启动器。它会自动创建 `output/<视频标题>/`：保留 Unicode 字母与数字，去掉标点和符号，并将连续空白替换为单个 `-`；同时保留原始视频、原始音频和合并文件，支持 `.part` 断点续传，并且不需要 OpenRouter Key 或 Agent 文本任务：
 
 ```bash
 python3 scripts/run_youtube_zh_dub.py \

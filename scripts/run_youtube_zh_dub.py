@@ -113,7 +113,13 @@ def needs_dashscope(args: argparse.Namespace, passthrough: list[str]) -> bool:
 
 def safe_directory_name(title: str, video_id: str) -> str:
     normalized = unicodedata.normalize("NFKC", title)
-    normalized = re.sub(r'[<>:"/\\|?*\x00-\x1f\x7f]', "-", normalized)
+    normalized = "".join(
+        char
+        for char in normalized
+        if char.isspace()
+        or char in "-_"
+        or unicodedata.category(char)[0] in {"L", "M", "N"}
+    )
     normalized = re.sub(r"\s+", "-", normalized).strip(" .-")
     normalized = re.sub(r"-{2,}", "-", normalized)
     if normalized in {"", ".", ".."}:
@@ -125,6 +131,29 @@ def safe_directory_name(title: str, video_id: str) -> str:
 
 def prepare_environment(project: Path) -> dict[str, str]:
     environment = os.environ.copy()
+    allowed_secrets = {
+        "DASHSCOPE_API_KEY",
+        "DASHSCOPE_WORKSPACE_ID",
+        "ALIYUN_COSYVOICE_VOICE",
+    }
+    secret_files = (
+        project / ".secrets" / "dashscope.env",
+        project.parent / ".secrets" / "dashscope.env",
+    )
+    for secret_file in secret_files:
+        if not secret_file.is_file():
+            continue
+        for line in secret_file.read_text(encoding="utf-8").splitlines():
+            match = re.fullmatch(
+                r"\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*",
+                line,
+            )
+            if not match or match.group(1) not in allowed_secrets:
+                continue
+            name, value = match.groups()
+            value = value.strip().strip("'\"")
+            if value and not environment.get(name):
+                environment[name] = value
     venv_bin = project / ".venv" / "bin"
     if venv_bin.is_dir():
         environment["PATH"] = f"{venv_bin}{os.pathsep}{environment.get('PATH', '')}"
