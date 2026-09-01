@@ -49,7 +49,8 @@ The launcher defaults to:
 - Maximum post-processing speed-up of `1.15x` and up to five translation-shortening attempts.
 - Fixed hosted voice synthesis: synthesize each Chinese sentence with `cosyvoice-v3.5-flash`, download its expiring result URL immediately, and cache the local 24 kHz WAV by text, model, voice, speed, and instruction.
 - Bounded hosted concurrency: use four `--tts-workers` by default. Successful sentences remain cached after partial API failures, so rerun unchanged and do not add `--force`.
-- Background preservation: use local Demucs `htdemucs` to remove the original English vocal stem, then sidechain-duck and mix the remaining stereo background under the Chinese dub. Cache both separation and mixing by content hash. Use `--background-mode none` only when the user explicitly wants the legacy voice-only output or Demucs is unavailable.
+- CPU tuning for the verified 10-vCPU/8GB VPS: cap local Whisper at six threads to avoid memory-bandwidth contention, run Demucs with two jobs, and use x264 `fast` for required H.264 encodes. Override with `--whisper-cpu-threads`, `--demucs-jobs`, or `--video-preset` after benchmarking a different host.
+- Background preservation: use local Demucs `htdemucs` with two jobs to remove the original English vocal stem, then sidechain-duck and mix the remaining stereo background under the Chinese dub. Cache both separation and mixing by content hash. Use `--background-mode none` only when the user explicitly wants the legacy voice-only output or Demucs is unavailable.
 - The bundled verified source pipeline at `<skill-directory>/youtube_dub.py`.
 - The project `.venv/bin` prepended to `PATH` when present.
 

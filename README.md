@@ -122,6 +122,15 @@ sudo apt-get install fonts-noto-cjk
 5. 默认用阿里云 `cosyvoice-v3.5-flash` 和一个固定复刻/设计音色并发生成中文；也可显式切换到本地逐句源音色克隆或 MAI-Voice-2；
 6. 超过舒适语速上限的句子会由同一 Agent 后端模型精简并重新生成；Demucs 从高质量原始音频中移除英文人声，`ffmpeg` 在中文说话时自动压低背景声并与中文配音混合；最后同时输出带可开关软字幕的通用版，以及把中文字幕烧录进画面的哔哩哔哩上传版。
 
+### 当前 VPS 的 CPU 优化默认值
+
+针对已验证的 10 vCPU、8GB 内存、无 GPU 环境，默认使用 6 个 Whisper CPU
+线程、2 个 Demucs job 和 x264 `fast`。实测相较旧默认值，3 个 15 秒
+Whisper 分段从 97.58 秒降至 79.25 秒，45 秒 Demucs 分离从 81.31 秒
+降至 62.06 秒；4K 30 秒硬字幕编码从 56.62 秒降至 46.23 秒，SSIM
+与 `medium` 的差异小于 0.00004。不同主机可用 `--whisper-cpu-threads`、
+`--demucs-jobs` 和 `--video-preset` 覆盖。
+
 ## 安全设置
 
 英文校对、主题识别、简体中文翻译和超时译文精简使用调用 Skill 的 Agent 当前后端模型。管线会生成带 JSON Schema 的文件请求；Agent 完成请求后写入同目录的响应文件并重跑原命令。该交换协议不依赖任何特定 Agent 或模型 CLI，详见 [`references/agent-text-backend.md`](references/agent-text-backend.md)。

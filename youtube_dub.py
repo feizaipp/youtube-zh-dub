@@ -44,6 +44,10 @@ DEFAULT_TRANSCRIBE_WORKERS = 1
 DEFAULT_TTS_WORKERS = 4
 DEFAULT_FIT_WORKERS = 4
 MAX_NETWORK_WORKERS = 16
+DEFAULT_VIDEO_PRESET = "fast"
+VIDEO_PRESETS = (
+    "ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow"
+)
 POLISH_BATCH_MAX_CHARACTERS = 9_000
 TRANSLATION_BATCH_MAX_CHARACTERS = 6_000
 TEXT_BACKEND = "calling-agent"
@@ -501,14 +505,16 @@ def probe_video_codec(path: Path) -> str:
     return codec
 
 
-def quicktime_video_options(codec: str) -> list[str]:
+def quicktime_video_options(
+    codec: str, preset: str = DEFAULT_VIDEO_PRESET
+) -> list[str]:
     if codec == "h264":
         return ["-c:v", "copy", "-tag:v", "avc1"]
     return [
         "-c:v",
         "libx264",
         "-preset",
-        "medium",
+        preset,
         "-crf",
         "20",
         "-pix_fmt",
@@ -516,6 +522,16 @@ def quicktime_video_options(codec: str) -> list[str]:
         "-tag:v",
         "avc1",
     ]
+
+
+def video_preset_cache_matches(
+    source_codec: str, metadata: dict[str, Any], requested_preset: str
+) -> bool:
+    """Return whether a cached video honors the requested x264 preset."""
+    if source_codec == "h264":
+        return True
+    # Before video presets were configurable, every transcode used medium.
+    return metadata.get("video_preset", "medium") == requested_preset
 
 
 def prepare_quicktime_subtitle(source: Path, destination: Path) -> Path:
@@ -2638,6 +2654,8 @@ def separate_background_audio(
         "--out",
         str(separation_root),
         "--float32",
+        "--jobs",
+        str(args.demucs_jobs),
     ]
     if args.demucs_device != "auto":
         command.extend(["--device", args.demucs_device])
@@ -2761,6 +2779,15 @@ def mux_video(args: argparse.Namespace, workdir: Path, video: Path, dub: Path) -
     final_audio = prepare_final_audio(args, workdir, video, dub)
     output = workdir / "dubbed.zh.mp4"
     subtitle_source = workdir / "transcript.zh.srt"
+    video_preset = getattr(args, "video_preset", DEFAULT_VIDEO_PRESET)
+    source_video_codec = probe_video_codec(video)
+    video_metadata_path = workdir / "segments" / "video_render.json"
+    video_metadata = (
+        read_json(video_metadata_path) if video_metadata_path.exists() else {}
+    )
+    preset_cache_matches = video_preset_cache_matches(
+        source_video_codec, video_metadata, video_preset
+    )
     remux_requested = args.force or args.remux_only
     if output.exists() and not remux_requested:
         input_paths = [video, final_audio]
@@ -2769,13 +2796,19 @@ def mux_video(args: argparse.Namespace, workdir: Path, video: Path, dub: Path) -
         newest_input = max(path.stat().st_mtime for path in input_paths)
         if (
             output.stat().st_mtime >= newest_input
+            and preset_cache_matches
             and math.isclose(
                 probe_video_duration(output), probe_video_duration(video), abs_tol=0.1
             )
         ):
             log("复用与当前配音和字幕一致的已合成视频")
             if subtitle_source.exists():
-                burn_bilibili_subtitles(workdir, output, subtitle_source)
+                burn_bilibili_subtitles(
+                    workdir,
+                    output,
+                    subtitle_source,
+                    video_preset,
+                )
             return output
 
     # If only the dub/subtitles changed, reuse the already encoded H.264 video
@@ -2783,6 +2816,7 @@ def mux_video(args: argparse.Namespace, workdir: Path, video: Path, dub: Path) -
     video_input = video
     if (
         output.exists()
+        and preset_cache_matches
         and video.stat().st_mtime <= output.stat().st_mtime
         and probe_video_codec(output) == "h264"
         and math.isclose(
@@ -2792,12 +2826,12 @@ def mux_video(args: argparse.Namespace, workdir: Path, video: Path, dub: Path) -
         video_input = output
         log("复用现有最终文件中的 H.264 视频轨，仅更新配音和字幕")
     temporary_output = workdir / "dubbed.zh.tmp.mp4"
-    source_video_codec = probe_video_codec(video_input)
-    video_options = quicktime_video_options(source_video_codec)
-    if source_video_codec == "h264":
+    input_video_codec = probe_video_codec(video_input)
+    video_options = quicktime_video_options(input_video_codec, video_preset)
+    if input_video_codec == "h264":
         log("源视频已是 H.264，将直接复制视频轨")
     else:
-        log(f"源视频为 {source_video_codec}，将转码为 QuickTime 兼容的 H.264")
+        log(f"源视频为 {input_video_codec}，将转码为 QuickTime 兼容的 H.264")
     subtitle = (
         prepare_quicktime_subtitle(
             subtitle_source, workdir / "segments" / "transcript.zh.quicktime.srt"
@@ -2881,13 +2915,28 @@ def mux_video(args: argparse.Namespace, workdir: Path, video: Path, dub: Path) -
     ])
     run(command)
     temporary_output.replace(output)
+    write_json(
+        video_metadata_path,
+        {
+            "source_codec": source_video_codec,
+            "video_preset": video_preset,
+        },
+    )
     if subtitle_source.exists():
-        burn_bilibili_subtitles(workdir, output, subtitle_source)
+        burn_bilibili_subtitles(
+            workdir,
+            output,
+            subtitle_source,
+            video_preset,
+        )
     return output
 
 
 def burn_bilibili_subtitles(
-    workdir: Path, source_video: Path, subtitle_source: Path
+    workdir: Path,
+    source_video: Path,
+    subtitle_source: Path,
+    video_preset: str = DEFAULT_VIDEO_PRESET,
 ) -> Path:
     """Create an upload-safe MP4 with Chinese subtitles rendered into pixels."""
     output = workdir / "dubbed.zh.bilibili.mp4"
@@ -2900,6 +2949,8 @@ def burn_bilibili_subtitles(
         and render_metadata.get("render_version") == BILIBILI_SUBTITLE_RENDER_VERSION
         and render_metadata.get("source_mtime_ns") == source_video.stat().st_mtime_ns
         and render_metadata.get("subtitle_mtime_ns") == subtitle_source.stat().st_mtime_ns
+        # Render metadata created before this option existed always used medium.
+        and render_metadata.get("video_preset", "medium") == video_preset
     ):
         log("复用与当前成片和字幕一致的哔哩哔哩硬字幕版")
         return output
@@ -2933,7 +2984,7 @@ def burn_bilibili_subtitles(
             "-c:v",
             "libx264",
             "-preset",
-            "medium",
+            video_preset,
             "-crf",
             "20",
             "-pix_fmt",
@@ -2958,6 +3009,7 @@ def burn_bilibili_subtitles(
             "source_mtime_ns": source_video.stat().st_mtime_ns,
             "subtitle_mtime_ns": subtitle_source.stat().st_mtime_ns,
             "font": "Noto Sans CJK SC",
+            "video_preset": video_preset,
         },
     )
     return output
@@ -3057,8 +3109,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--whisper-cpu-threads",
         type=int,
-        default=max(1, min(8, os.cpu_count() or 1)),
-        help="本地 Whisper 使用的 CPU 线程数，默认最多 8",
+        default=max(1, min(6, os.cpu_count() or 1)),
+        help="本地 Whisper 使用的 CPU 线程数；旧款多核 CPU 默认最多 6，避免内存带宽争用",
     )
     parser.add_argument(
         "--text-model",
@@ -3137,6 +3189,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Demucs 运行设备；默认自动选择",
     )
     parser.add_argument(
+        "--demucs-jobs",
+        type=int,
+        default=2,
+        help="Demucs CPU 分离并发任务数；8GB/10核 VPS 默认 2",
+    )
+    parser.add_argument(
+        "--video-preset",
+        choices=VIDEO_PRESETS,
+        default=DEFAULT_VIDEO_PRESET,
+        help="H.264 编码预设；默认 fast，在接近 medium 质量下缩短 CPU 编码时间",
+    )
+    parser.add_argument(
         "--background-volume",
         type=float,
         default=DEFAULT_BACKGROUND_VOLUME,
@@ -3211,6 +3275,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise PipelineError("--whisper-cpu-threads 必须大于 0")
     if args.cosyvoice_threads < 1:
         raise PipelineError("--cosyvoice-threads 必须大于 0")
+    if not 0 <= args.demucs_jobs <= MAX_NETWORK_WORKERS:
+        raise PipelineError(
+            f"--demucs-jobs 必须在 0 到 {MAX_NETWORK_WORKERS} 之间"
+        )
     if not 1 <= args.transcribe_workers <= MAX_NETWORK_WORKERS:
         raise PipelineError(
             f"--transcribe-workers 必须在 1 到 {MAX_NETWORK_WORKERS} 之间"
@@ -3287,7 +3355,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             log("仅加入字幕模式：复制现有音视频轨，不调用模型")
             output = embed_subtitles_only(workdir)
             bilibili_output = burn_bilibili_subtitles(
-                workdir, output, workdir / "transcript.zh.srt"
+                workdir,
+                output,
+                workdir / "transcript.zh.srt",
+                args.video_preset,
             )
             log(f"中文字幕已加入：{output}")
             log(f"哔哩哔哩硬字幕版：{bilibili_output}")

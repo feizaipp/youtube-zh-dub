@@ -223,6 +223,8 @@ class ConcurrencyTests(unittest.TestCase):
         self.assertEqual(args.tts_backend, "aliyun-cosyvoice")
         self.assertEqual(args.tts_workers, 4)
         self.assertEqual(args.fit_workers, 4)
+        self.assertEqual(args.whisper_cpu_threads, min(6, os.cpu_count() or 1))
+        self.assertEqual(args.video_preset, "fast")
 
         args.transcribe_workers = 0
         with self.assertRaises(youtube_dub.PipelineError):
@@ -549,6 +551,7 @@ class BackgroundAudioTests(unittest.TestCase):
             "background_mode": "demucs",
             "demucs_model": "htdemucs",
             "demucs_device": "cpu",
+            "demucs_jobs": 2,
             "background_volume": 0.7,
             "background_duck_ratio": 4.0,
         }
@@ -559,6 +562,7 @@ class BackgroundAudioTests(unittest.TestCase):
         args = youtube_dub.build_parser().parse_args([])
         self.assertEqual(args.background_mode, "demucs")
         self.assertEqual(args.demucs_model, "htdemucs")
+        self.assertEqual(args.demucs_jobs, 2)
         self.assertEqual(args.background_volume, 0.7)
         self.assertEqual(args.background_duck_ratio, 4.0)
 
@@ -620,6 +624,7 @@ class BackgroundAudioTests(unittest.TestCase):
             self.assertIn("--two-stems", observed[0])
             self.assertIn("vocals", observed[0])
             self.assertIn("--device", observed[0])
+            self.assertEqual(observed[0][observed[0].index("--jobs") + 1], "2")
             self.assertEqual(observed[0][-1], str(retained))
             metadata = youtube_dub.read_json(
                 workdir / "segments" / "demucs_background.json"
@@ -790,10 +795,50 @@ class DownloadTests(unittest.TestCase):
             self.assertTrue(stable_audio.exists())
 
     def test_av1_is_transcoded_for_quicktime(self):
-        options = youtube_dub.quicktime_video_options("av1")
+        options = youtube_dub.quicktime_video_options("av1", "fast")
         self.assertIn("libx264", options)
         self.assertIn("yuv420p", options)
         self.assertIn("avc1", options)
+        self.assertEqual(options[options.index("-preset") + 1], "fast")
+
+    def test_video_preset_can_be_overridden(self):
+        options = youtube_dub.quicktime_video_options("av1", "medium")
+        self.assertEqual(options[options.index("-preset") + 1], "medium")
+
+    def test_video_preset_cache_requires_matching_transcode_preset(self):
+        self.assertTrue(youtube_dub.video_preset_cache_matches("h264", {}, "fast"))
+        self.assertTrue(youtube_dub.video_preset_cache_matches("av1", {}, "medium"))
+        self.assertFalse(youtube_dub.video_preset_cache_matches("av1", {}, "fast"))
+        self.assertTrue(
+            youtube_dub.video_preset_cache_matches(
+                "av1", {"video_preset": "fast"}, "fast"
+            )
+        )
+
+    def test_subtitles_only_forwards_video_preset(self):
+        with tempfile.TemporaryDirectory() as folder, mock.patch.object(
+            youtube_dub, "require_tools"
+        ), mock.patch.object(
+            youtube_dub,
+            "embed_subtitles_only",
+            return_value=Path(folder) / "dubbed.zh.mp4",
+        ), mock.patch.object(
+            youtube_dub,
+            "burn_bilibili_subtitles",
+            return_value=Path(folder) / "dubbed.zh.bilibili.mp4",
+        ) as burn:
+            result = youtube_dub.main(
+                [
+                    "--subtitles-only",
+                    "--workdir",
+                    folder,
+                    "--video-preset",
+                    "medium",
+                ]
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(burn.call_args.args[3], "medium")
 
     def test_h264_is_copied_for_quicktime(self):
         options = youtube_dub.quicktime_video_options("h264")
@@ -842,6 +887,7 @@ class DownloadTests(unittest.TestCase):
             self.assertEqual(observed[observed.index("-c:a") + 1], "copy")
             self.assertIn("-sn", observed)
             self.assertIn("libx264", observed)
+            self.assertEqual(observed[observed.index("-preset") + 1], "fast")
 
     def test_bilibili_output_is_reused_when_inputs_are_unchanged(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -860,6 +906,7 @@ class DownloadTests(unittest.TestCase):
                     "source_mtime_ns": source.stat().st_mtime_ns,
                     "subtitle_mtime_ns": subtitle.stat().st_mtime_ns,
                     "font": "Noto Sans CJK SC",
+                    "video_preset": "fast",
                 },
             )
 
