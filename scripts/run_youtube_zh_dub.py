@@ -173,6 +173,9 @@ def fetch_video_title(url: str, environment: dict[str, str], passthrough: list[s
     cookies = option_value(passthrough, "--cookies-from-browser")
     if cookies:
         command.extend(["--cookies-from-browser", cookies])
+    cookies_file = option_value(passthrough, "--cookies")
+    if cookies_file:
+        command.extend(["--cookies", cookies_file])
     command.extend(["--print", "%(title)s", url])
     try:
         result = subprocess.run(

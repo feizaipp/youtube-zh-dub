@@ -768,6 +768,20 @@ class DownloadTests(unittest.TestCase):
             "youtube:player_client=web_embedded",
         )
 
+    def test_cookie_file_is_forwarded_to_ytdlp(self):
+        args = argparse.Namespace(
+            cookies_from_browser=None,
+            cookies=Path("/root/youtube-cookies.txt"),
+            proxy=None,
+            youtube_player_client="web_embedded",
+        )
+        with mock.patch.object(youtube_dub.shutil, "which", return_value=None):
+            command = youtube_dub.yt_dlp_common(args)
+        self.assertEqual(
+            command[command.index("--cookies") + 1],
+            "/root/youtube-cookies.txt",
+        )
+
     def test_retained_video_and_audio_get_stable_names(self):
         with tempfile.TemporaryDirectory() as folder:
             workdir = Path(folder)

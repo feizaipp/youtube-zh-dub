@@ -60,6 +60,9 @@ Pass supported pipeline options after the URL. Examples:
 # Use Chrome cookies only when the user authorizes it or YouTube requires login.
 python3 "$SKILL_DIR/scripts/run_youtube_zh_dub.py" URL --cookies-from-browser chrome
 
+# Or use an explicitly supplied Netscape-format cookie file.
+python3 "$SKILL_DIR/scripts/run_youtube_zh_dub.py" URL --cookies /absolute/path/cookies.txt
+
 # Explicit alternate output directory.
 python3 "$SKILL_DIR/scripts/run_youtube_zh_dub.py" URL --workdir /absolute/output/path
 ```

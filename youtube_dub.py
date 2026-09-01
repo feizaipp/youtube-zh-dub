@@ -457,6 +457,9 @@ def yt_dlp_common(args: argparse.Namespace) -> list[str]:
         )
     if args.cookies_from_browser:
         command.extend(["--cookies-from-browser", args.cookies_from_browser])
+    cookies_file = getattr(args, "cookies", None)
+    if cookies_file:
+        command.extend(["--cookies", str(cookies_file)])
     proxy = args.proxy or urllib.request.getproxies().get("https") or urllib.request.getproxies().get("http")
     if proxy:
         # Both streams are fetched by yt-dlp's native downloader, so a single
@@ -3215,6 +3218,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--cookies-from-browser",
         help="遇到 YouTube 登录校验时传给 yt-dlp，例如 chrome 或 safari",
+    )
+    parser.add_argument(
+        "--cookies",
+        type=Path,
+        help="Netscape 格式 cookies.txt 路径；用于 YouTube 登录或机器人验证",
     )
     parser.add_argument(
         "--youtube-player-client",

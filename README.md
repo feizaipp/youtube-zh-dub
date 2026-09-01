@@ -77,6 +77,13 @@ PATH="$PWD/.venv/bin:$PATH" python3 scripts/run_youtube_zh_dub.py URL \
   --tts-backend aliyun-cosyvoice --tts-workers 4 --fit-workers 2
 ```
 
+如果 YouTube 要求登录或机器人验证，可在用户明确授权后传入浏览器 cookies，
+或使用权限为 `0600` 的 Netscape 格式文件：
+
+```bash
+python3 scripts/run_youtube_zh_dub.py URL --cookies /absolute/path/youtube-cookies.txt
+```
+
 如需验证可选的本地回退后端，`--cosyvoice-threads 1` 与 `--fit-workers 2`
 是 8 GiB 内存机器的保守起点；本地 TTS 始终只加载一个模型：
 
