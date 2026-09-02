@@ -103,7 +103,7 @@ Use the pipeline defaults unless the user asks otherwise. They enforce these inv
 - Shorten only Chinese sentences whose natural speech would exceed the maximum tempo, regenerate only those lines, and never silently fast-forward beyond the cap.
 - Produce H.264/AAC video with an embedded default/forced `mov_text` Chinese subtitle stream compatible with QuickTime.
 - Build the final AAC track from the high-quality retained source audio, never the 16 kHz mono transcription WAV. Preserve the Demucs background stem at stereo quality and duck it only while Chinese speech is active.
-- Also produce `dubbed.zh.bilibili.mp4` with Chinese subtitles burned into the H.264 picture so video-platform transcoding cannot discard them; copy the already encoded AAC dub audio without regenerating speech.
+- Also produce the cross-platform `dubbed.zh.hardsub.mp4` with Chinese subtitles burned into the H.264 picture so platform transcoding cannot discard them; copy the already encoded AAC dub audio without regenerating speech.
 - Use `Noto Sans CJK SC` for burned Chinese subtitles and visually inspect a subtitle-bearing frame; install `fonts-noto-cjk` on Debian/Ubuntu if glyphs render as boxes.
 
 Do not manually edit timestamps or invoke independent download/transcription commands unless repairing a demonstrated pipeline defect.
@@ -112,7 +112,7 @@ Do not manually edit timestamps or invoke independent download/transcription com
 
 After the command succeeds:
 
-1. Confirm `video_metadata.json`, `dubbed.zh.mp4`, `dubbed.zh.bilibili.mp4`, `transcript.en.polished.json`, `transcript.zh.json`, `transcript.zh.srt`, and `sync_report.json` exist inside `output/<video-title>`.
+1. Confirm `video_metadata.json`, `dubbed.zh.mp4`, `dubbed.zh.hardsub.mp4`, `transcript.en.polished.json`, `transcript.zh.json`, `transcript.zh.srt`, and `sync_report.json` exist inside `output/<video-title>`.
 2. Read `sync_report.json`; require zero warnings and no segment tempo above the configured cap.
 3. Use `ffprobe` to require video, audio, and subtitle streams. Confirm H.264 video, AAC audio, and `mov_text` subtitle codecs.
 4. Decode the full final file with `ffmpeg -v error -i dubbed.zh.mp4 -f null -`; require exit code 0.

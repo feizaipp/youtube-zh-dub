@@ -54,7 +54,7 @@ TEXT_BACKEND = "calling-agent"
 TEXT_PIPELINE_VERSION = 4
 TIMESTAMP_PIPELINE_VERSION = 1
 ALIGNMENT_PIPELINE_VERSION = 2
-BILIBILI_SUBTITLE_RENDER_VERSION = 2
+HARDSUB_RENDER_VERSION = 2
 BACKGROUND_AUDIO_PIPELINE_VERSION = 1
 DEFAULT_BACKGROUND_MODE = "demucs"
 DEFAULT_DEMUCS_MODEL = "htdemucs"
@@ -2806,7 +2806,7 @@ def mux_video(args: argparse.Namespace, workdir: Path, video: Path, dub: Path) -
         ):
             log("复用与当前配音和字幕一致的已合成视频")
             if subtitle_source.exists():
-                burn_bilibili_subtitles(
+                burn_hardsub_subtitles(
                     workdir,
                     output,
                     subtitle_source,
@@ -2926,7 +2926,7 @@ def mux_video(args: argparse.Namespace, workdir: Path, video: Path, dub: Path) -
         },
     )
     if subtitle_source.exists():
-        burn_bilibili_subtitles(
+        burn_hardsub_subtitles(
             workdir,
             output,
             subtitle_source,
@@ -2935,35 +2935,35 @@ def mux_video(args: argparse.Namespace, workdir: Path, video: Path, dub: Path) -
     return output
 
 
-def burn_bilibili_subtitles(
+def burn_hardsub_subtitles(
     workdir: Path,
     source_video: Path,
     subtitle_source: Path,
     video_preset: str = DEFAULT_VIDEO_PRESET,
 ) -> Path:
     """Create an upload-safe MP4 with Chinese subtitles rendered into pixels."""
-    output = workdir / "dubbed.zh.bilibili.mp4"
-    metadata_path = workdir / "segments" / "bilibili_subtitle_render.json"
+    output = workdir / "dubbed.zh.hardsub.mp4"
+    metadata_path = workdir / "segments" / "hardsub_render.json"
     newest_input = max(source_video.stat().st_mtime, subtitle_source.stat().st_mtime)
     render_metadata = read_json(metadata_path) if metadata_path.exists() else {}
     if (
         output.exists()
         and output.stat().st_mtime >= newest_input
-        and render_metadata.get("render_version") == BILIBILI_SUBTITLE_RENDER_VERSION
+        and render_metadata.get("render_version") == HARDSUB_RENDER_VERSION
         and render_metadata.get("source_mtime_ns") == source_video.stat().st_mtime_ns
         and render_metadata.get("subtitle_mtime_ns") == subtitle_source.stat().st_mtime_ns
         # Render metadata created before this option existed always used medium.
         and render_metadata.get("video_preset", "medium") == video_preset
     ):
-        log("复用与当前成片和字幕一致的哔哩哔哩硬字幕版")
+        log("复用与当前成片和字幕一致的通用硬字幕版")
         return output
 
-    temporary_output = workdir / "dubbed.zh.bilibili.tmp.mp4"
+    temporary_output = workdir / "dubbed.zh.hardsub.tmp.mp4"
     subtitle_filter = (
         f"subtitles=filename='{escape_subtitle_filter_path(subtitle_source)}':"
         "force_style='FontName=Noto Sans CJK SC,Alignment=2,MarginV=28,Outline=2,Shadow=0'"
     )
-    log("烧录中文字幕，生成哔哩哔哩上传版（视频需要重新编码，音频直接复制）")
+    log("烧录中文字幕，生成通用硬字幕版（视频需要重新编码，音频直接复制）")
     run(
         [
             "ffmpeg",
@@ -3008,7 +3008,7 @@ def burn_bilibili_subtitles(
     write_json(
         metadata_path,
         {
-            "render_version": BILIBILI_SUBTITLE_RENDER_VERSION,
+            "render_version": HARDSUB_RENDER_VERSION,
             "source_mtime_ns": source_video.stat().st_mtime_ns,
             "subtitle_mtime_ns": subtitle_source.stat().st_mtime_ns,
             "font": "Noto Sans CJK SC",
@@ -3362,14 +3362,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.subtitles_only:
             log("仅加入字幕模式：复制现有音视频轨，不调用模型")
             output = embed_subtitles_only(workdir)
-            bilibili_output = burn_bilibili_subtitles(
+            hardsub_output = burn_hardsub_subtitles(
                 workdir,
                 output,
                 workdir / "transcript.zh.srt",
                 args.video_preset,
             )
             log(f"中文字幕已加入：{output}")
-            log(f"哔哩哔哩硬字幕版：{bilibili_output}")
+            log(f"通用硬字幕版：{hardsub_output}")
             return 0
 
         if args.remux_only:
@@ -3381,7 +3381,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             output = mux_video(args, workdir, video, dub)
             log(f"重新封装完成：{output}")
             if (workdir / "transcript.zh.srt").exists():
-                log(f"哔哩哔哩硬字幕版：{workdir / 'dubbed.zh.bilibili.mp4'}")
+                log(f"通用硬字幕版：{workdir / 'dubbed.zh.hardsub.mp4'}")
             return 0
 
         ensure_manifest(args, workdir)
@@ -3412,7 +3412,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         output = mux_video(args, workdir, video, dub)
         log(f"完成：{output}")
-        log(f"哔哩哔哩硬字幕版：{workdir / 'dubbed.zh.bilibili.mp4'}")
+        log(f"通用硬字幕版：{workdir / 'dubbed.zh.hardsub.mp4'}")
         return 0
     except (PipelineError, OSError, ValueError) as exc:
         print(f"错误：{exc}", file=sys.stderr)

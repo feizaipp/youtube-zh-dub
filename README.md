@@ -9,7 +9,7 @@ Skill 目录后即可调用；
 
 - Python 3.10 或更高版本；
 - `ffmpeg`（同时提供 `ffprobe`）；
-- 生成哔哩哔哩硬字幕版需要中文字体，Ubuntu/Debian 推荐安装 `fonts-noto-cjk`；
+- 生成通用硬字幕版需要中文字体，Ubuntu/Debian 推荐安装 `fonts-noto-cjk`；
 - 完整配音需要调用 Skill 的 Agent 能使用其当前配置的后端模型完成结构化文本任务；
 - 英文词级转录默认在本地运行 `faster-whisper medium.en`（CPU INT8），无需转录 API 费用；
 - 默认中文配音使用阿里云百炼 `cosyvoice-v3.5-flash` 固定复刻/设计音色；本地 Fun-CosyVoice3-0.5B 仍可作为显式回退后端；
@@ -127,7 +127,7 @@ sudo apt-get install fonts-noto-cjk
 3. 由调用 Skill 的 Agent 当前后端模型跨越原始切块检查英文语法和 ASR 重复词，再把完整句子按词序对齐回真实词级时间轴；句间原始停顿会被保留；
 4. 由同一 Agent 后端模型识别主题，以领域专家口吻翻译为简体中文，并锁定校对后句子的时间戳；
 5. 默认用阿里云 `cosyvoice-v3.5-flash` 和一个固定复刻/设计音色并发生成中文；也可显式切换到本地逐句源音色克隆或 MAI-Voice-2；
-6. 超过舒适语速上限的句子会由同一 Agent 后端模型精简并重新生成；Demucs 从高质量原始音频中移除英文人声，`ffmpeg` 在中文说话时自动压低背景声并与中文配音混合；最后同时输出带可开关软字幕的通用版，以及把中文字幕烧录进画面的哔哩哔哩上传版。
+6. 超过舒适语速上限的句子会由同一 Agent 后端模型精简并重新生成；Demucs 从高质量原始音频中移除英文人声，`ffmpeg` 在中文说话时自动压低背景声并与中文配音混合；最后同时输出带可开关软字幕的通用版，以及把中文字幕烧录进画面的跨平台硬字幕版。
 
 ### 当前 VPS 的 CPU 优化默认值
 
@@ -344,7 +344,7 @@ python3 youtube_dub.py --workdir output/full --subtitles-only
 - `chinese_mix.wav`：背景轨经过侧链压低后与中文配音混合得到的最终音轨；
 - `sync_report.json`：每段裁剪后自然语音时长、目标时长、最终调速倍率和本轮自动精简记录；
 - `dubbed.zh.mp4`：最终中文配音视频。
-- `dubbed.zh.bilibili.mp4`：中文字幕已烧录进画面的 H.264/AAC 成片，适合直接上传哔哩哔哩；字幕始终可见，不依赖平台识别 MP4 内挂字幕轨。
+- `dubbed.zh.hardsub.mp4`：中文字幕已烧录进画面的 H.264/AAC 成片，适合直接上传常见视频平台；字幕始终可见，不依赖平台识别 MP4 内挂字幕轨。
 
 ## 断点续传最终视频
 

@@ -703,7 +703,7 @@ class BackgroundAudioTests(unittest.TestCase):
                 youtube_dub, "probe_video_codec", return_value="h264"
             ), mock.patch.object(
                 youtube_dub, "run", side_effect=fake_run
-            ), mock.patch.object(youtube_dub, "burn_bilibili_subtitles"):
+            ), mock.patch.object(youtube_dub, "burn_hardsub_subtitles"):
                 youtube_dub.mux_video(args, workdir, video, dub)
 
         self.assertNotIn("-shortest", observed)
@@ -838,8 +838,8 @@ class DownloadTests(unittest.TestCase):
             return_value=Path(folder) / "dubbed.zh.mp4",
         ), mock.patch.object(
             youtube_dub,
-            "burn_bilibili_subtitles",
-            return_value=Path(folder) / "dubbed.zh.bilibili.mp4",
+            "burn_hardsub_subtitles",
+            return_value=Path(folder) / "dubbed.zh.hardsub.mp4",
         ) as burn:
             result = youtube_dub.main(
                 [
@@ -872,7 +872,7 @@ class DownloadTests(unittest.TestCase):
             self.assertIn("00:00:00,100 --> 00:00:15,000", result)
             self.assertIn("00:00:15,000 --> 00:00:30,000", result)
 
-    def test_bilibili_output_burns_subtitles_and_copies_audio(self):
+    def test_hardsub_output_burns_subtitles_and_copies_audio(self):
         with tempfile.TemporaryDirectory() as folder:
             workdir = Path(folder)
             source = workdir / "dubbed.zh.mp4"
@@ -886,16 +886,16 @@ class DownloadTests(unittest.TestCase):
 
             def fake_run(command, **_kwargs):
                 observed.extend(command)
-                Path(command[-1]).write_bytes(b"bilibili")
+                Path(command[-1]).write_bytes(b"hardsub")
                 return mock.Mock()
 
             with mock.patch.object(youtube_dub, "run", side_effect=fake_run):
-                output = youtube_dub.burn_bilibili_subtitles(
+                output = youtube_dub.burn_hardsub_subtitles(
                     workdir, source, subtitle
                 )
 
-            self.assertEqual(output.name, "dubbed.zh.bilibili.mp4")
-            self.assertEqual(output.read_bytes(), b"bilibili")
+            self.assertEqual(output.name, "dubbed.zh.hardsub.mp4")
+            self.assertEqual(output.read_bytes(), b"hardsub")
             self.assertIn("-vf", observed)
             self.assertIn("subtitles=filename=", observed[observed.index("-vf") + 1])
             self.assertEqual(observed[observed.index("-c:a") + 1], "copy")
@@ -903,20 +903,20 @@ class DownloadTests(unittest.TestCase):
             self.assertIn("libx264", observed)
             self.assertEqual(observed[observed.index("-preset") + 1], "fast")
 
-    def test_bilibili_output_is_reused_when_inputs_are_unchanged(self):
+    def test_hardsub_output_is_reused_when_inputs_are_unchanged(self):
         with tempfile.TemporaryDirectory() as folder:
             workdir = Path(folder)
             source = workdir / "dubbed.zh.mp4"
             subtitle = workdir / "transcript.zh.srt"
-            output = workdir / "dubbed.zh.bilibili.mp4"
+            output = workdir / "dubbed.zh.hardsub.mp4"
             source.write_bytes(b"video")
             subtitle.write_text("subtitle", encoding="utf-8")
             output.write_bytes(b"existing")
             os.utime(output, (output.stat().st_atime, max(source.stat().st_mtime, subtitle.stat().st_mtime) + 1))
             youtube_dub.write_json(
-                workdir / "segments" / "bilibili_subtitle_render.json",
+                workdir / "segments" / "hardsub_render.json",
                 {
-                    "render_version": youtube_dub.BILIBILI_SUBTITLE_RENDER_VERSION,
+                    "render_version": youtube_dub.HARDSUB_RENDER_VERSION,
                     "source_mtime_ns": source.stat().st_mtime_ns,
                     "subtitle_mtime_ns": subtitle.stat().st_mtime_ns,
                     "font": "Noto Sans CJK SC",
@@ -925,7 +925,7 @@ class DownloadTests(unittest.TestCase):
             )
 
             with mock.patch.object(youtube_dub, "run") as mocked_run:
-                result = youtube_dub.burn_bilibili_subtitles(
+                result = youtube_dub.burn_hardsub_subtitles(
                     workdir, source, subtitle
                 )
 
