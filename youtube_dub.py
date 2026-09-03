@@ -844,7 +844,7 @@ def transcribe_segment(
     start: float,
     end: float,
     api_key: str,
-) -> tuple[Segment, list[TimedWord]]:
+) -> tuple[Segment | None, list[TimedWord]]:
     """Extract and transcribe one independent ASR segment."""
     chunk = segment_dir / f"segment_{index:04d}.wav"
     extract_segment(audio, chunk, start, end)
@@ -865,7 +865,7 @@ def transcribe_segment(
     assert isinstance(response, dict)
     text = str(response.get("text", "")).strip()
     if not text:
-        raise PipelineError(f"转录模型没有为片段 {index} 返回文本")
+        return None, []
     words = []
     for item in response.get("words", []):
         word = str(item.get("word", item.get("text", ""))).strip()
@@ -887,7 +887,7 @@ def transcribe_segment_locally(
     index: int,
     start: float,
     end: float,
-) -> tuple[Segment, list[TimedWord]]:
+) -> tuple[Segment | None, list[TimedWord]]:
     """Extract and transcribe one ASR segment with a shared faster-whisper model."""
     chunk = segment_dir / f"segment_{index:04d}.wav"
     extract_segment(audio, chunk, start, end)
@@ -902,7 +902,7 @@ def transcribe_segment_locally(
     local_segments = list(generated_segments)
     text = " ".join(item.text.strip() for item in local_segments if item.text.strip()).strip()
     if not text:
-        raise PipelineError(f"本地转录模型没有为片段 {index} 返回文本")
+        return None, []
     words: list[TimedWord] = []
     for segment in local_segments:
         for item in segment.words or ():
@@ -924,6 +924,7 @@ def transcribe_audio(
     transcript_path = workdir / "transcript.en.json"
     cached_by_id: dict[int, Segment] = {}
     cached_words_by_chunk: dict[int, list[TimedWord]] = {}
+    cached_non_speech_ids: set[int] = set()
     if transcript_path.exists() and not args.force:
         cached_document = read_json(transcript_path)
         cached_segments = parse_segments(cached_document)
@@ -950,12 +951,16 @@ def transcribe_audio(
             return cached_segments
         if compatible_cache:
             cached_by_id = {item.id: item for item in cached_segments}
+            cached_non_speech_ids = {
+                int(item) for item in cached_document.get("non_speech_chunk_ids", [])
+            }
             for item in cached_document.get("words", []):
                 chunk_id = int(item.get("chunk_id", -1))
                 parsed = parse_words({"words": [item]})
                 if parsed and chunk_id >= 0:
                     cached_words_by_chunk.setdefault(chunk_id, []).extend(parsed)
-            log(f"发现未完成的词级英文转录，将从 {len(cached_segments)} 个已完成片段继续")
+            completed_chunk_count = len(cached_segments) + len(cached_non_speech_ids)
+            log(f"发现未完成的词级英文转录，将从 {completed_chunk_count} 个已完成片段继续")
         else:
             log("旧英文转录不含兼容词级时间轴，将重新转录")
 
@@ -974,8 +979,13 @@ def transcribe_audio(
     total_segments = len(boundaries) - 1
     completed_by_id: dict[int, Segment] = {}
     completed_words_by_id: dict[int, list[TimedWord]] = {}
+    non_speech_ids: set[int] = set()
     pending: list[tuple[int, float, float]] = []
     for index, (start, end) in enumerate(zip(boundaries, boundaries[1:])):
+        if index in cached_non_speech_ids:
+            log(f"复用无语音片段 {index + 1}/{total_segments}")
+            non_speech_ids.add(index)
+            continue
         cached = cached_by_id.get(index)
         if (
             cached
@@ -1025,7 +1035,8 @@ def transcribe_audio(
                 "workers": args.transcribe_workers,
                 "segments": [asdict(item) for item in ordered],
                 "words": ordered_words,
-                "complete": len(ordered) == total_segments,
+                "non_speech_chunk_ids": sorted(non_speech_ids),
+                "complete": len(ordered) + len(non_speech_ids) == total_segments,
             },
         )
 
@@ -1054,7 +1065,7 @@ def transcribe_audio(
         worker_count = min(args.transcribe_workers, len(pending))
         log(f"并发转录 {len(pending)} 个片段（{worker_count} 个线程）")
         failures: list[tuple[int, Exception]] = []
-        futures: dict[Future[tuple[Segment, list[TimedWord]]], int] = {}
+        futures: dict[Future[tuple[Segment | None, list[TimedWord]]], int] = {}
         with ThreadPoolExecutor(
             max_workers=worker_count, thread_name_prefix="youtube-dub-asr"
         ) as executor:
@@ -1090,6 +1101,12 @@ def transcribe_audio(
                     failures.append((index, exc))
                     log(f"转录片段 {index + 1}/{total_segments} 失败：{exc}")
                     continue
+                if segment is None:
+                    non_speech_ids.add(index)
+                    completed_count = len(completed_by_id) + len(non_speech_ids)
+                    log(f"无英语语音 {completed_count}/{total_segments}：片段 {index + 1}")
+                    write_checkpoint()
+                    continue
                 completed_by_id[index] = segment
                 completed_words_by_id[index] = words
                 log(
@@ -1105,7 +1122,7 @@ def transcribe_audio(
             )
 
     write_checkpoint()
-    segments = [completed_by_id[index] for index in range(total_segments)]
+    segments = [completed_by_id[index] for index in sorted(completed_by_id)]
     write_srt(workdir / "transcript.en.srt", segments)
     return segments
 

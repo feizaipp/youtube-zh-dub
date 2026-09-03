@@ -296,6 +296,50 @@ class ConcurrencyTests(unittest.TestCase):
         self.assertEqual(len(document["words"]), 6)
         self.assertEqual(document["words"][2]["start"], 10.1)
 
+    def test_transcription_records_non_speech_chunks_without_failing(self):
+        args = argparse.Namespace(
+            force=True,
+            url="https://youtu.be/example",
+            start_seconds=0.0,
+            chunk_seconds=10.0,
+            transcriber_model="openai/whisper-1",
+            transcriber_backend="openrouter-whisper1",
+            transcribe_workers=1,
+        )
+
+        def fake_extract(_source, destination, _start, _end):
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(destination.stem.encode("ascii"))
+
+        def fake_request(_endpoint, _api_key, payload, **_kwargs):
+            name = base64.b64decode(payload["input_audio"]["data"]).decode("ascii")
+            index = int(name.rsplit("_", 1)[1])
+            if index == 1:
+                return {"text": "", "words": []}
+            return {
+                "text": f"Sentence {index}.",
+                "words": [{"word": "Sentence", "start": 0.1, "end": 0.5}],
+            }
+
+        with tempfile.TemporaryDirectory() as folder, mock.patch.object(
+            youtube_dub, "probe_duration", return_value=30.0
+        ), mock.patch.object(
+            youtube_dub, "detect_silence_midpoints", return_value=[]
+        ), mock.patch.object(
+            youtube_dub, "extract_segment", side_effect=fake_extract
+        ), mock.patch.object(
+            youtube_dub, "require_openrouter_api_key", return_value="test-key"
+        ), mock.patch.object(
+            youtube_dub, "openrouter_request", side_effect=fake_request
+        ):
+            workdir = Path(folder)
+            result = youtube_dub.transcribe_audio(args, workdir, workdir / "audio.wav")
+            document = youtube_dub.read_json(workdir / "transcript.en.json")
+
+        self.assertEqual([segment.id for segment in result], [0, 2])
+        self.assertEqual(document["non_speech_chunk_ids"], [1])
+        self.assertTrue(document["complete"])
+
     def test_tts_preparation_runs_concurrently(self):
         args = argparse.Namespace(tts_workers=4, tts_backend="mai")
         segments = [
