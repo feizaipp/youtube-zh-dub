@@ -111,6 +111,32 @@ def needs_dashscope(args: argparse.Namespace, passthrough: list[str]) -> bool:
     return tts_backend == "aliyun-cosyvoice" and stop_after in {"synthesize", "mux"}
 
 
+def aliyun_configuration_error(
+    environment: dict[str, str], passthrough: list[str]
+) -> str | None:
+    if not environment.get("DASHSCOPE_API_KEY"):
+        return "请先通过 DASHSCOPE_API_KEY 提供华北2（北京）地域的百炼 API Key。"
+    voice_mode = option_value(passthrough, "--aliyun-voice-mode") or "source-clone"
+    if voice_mode == "fixed":
+        if not (
+            environment.get("ALIYUN_COSYVOICE_VOICE")
+            or option_value(passthrough, "--voice")
+        ):
+            return (
+                "固定音色模式需要 ALIYUN_COSYVOICE_VOICE 或 --voice 提供 voice_id。"
+            )
+        return None
+    if not (
+        environment.get("YOUTUBE_DUB_VOICE_SAMPLE_BASE_URL")
+        or option_value(passthrough, "--voice-sample-base-url")
+    ):
+        return (
+            "自动声音复刻需要 YOUTUBE_DUB_VOICE_SAMPLE_BASE_URL 或 "
+            "--voice-sample-base-url。"
+        )
+    return None
+
+
 def safe_directory_name(title: str, video_id: str) -> str:
     normalized = unicodedata.normalize("NFKC", title)
     normalized = "".join(
@@ -135,6 +161,7 @@ def prepare_environment(project: Path) -> dict[str, str]:
         "DASHSCOPE_API_KEY",
         "DASHSCOPE_WORKSPACE_ID",
         "ALIYUN_COSYVOICE_VOICE",
+        "YOUTUBE_DUB_VOICE_SAMPLE_BASE_URL",
     }
     secret_files = (
         project / ".secrets" / "dashscope.env",
@@ -389,20 +416,9 @@ def main() -> int:
         )
         return 2
     if not args.dry_run and needs_dashscope(args, passthrough):
-        if not environment.get("DASHSCOPE_API_KEY"):
-            print(
-                "错误：请先通过环境变量 DASHSCOPE_API_KEY 提供华北2（北京）地域的百炼 API Key。",
-                file=sys.stderr,
-            )
-            return 2
-        if not (
-            environment.get("ALIYUN_COSYVOICE_VOICE")
-            or option_value(passthrough, "--voice")
-        ):
-            print(
-                "错误：请通过 ALIYUN_COSYVOICE_VOICE 或 --voice 提供与 cosyvoice-v3.5-flash 绑定的 voice_id。",
-                file=sys.stderr,
-            )
+        configuration_error = aliyun_configuration_error(environment, passthrough)
+        if configuration_error:
+            print(f"错误：{configuration_error}", file=sys.stderr)
             return 2
     if args.dry_run:
         required_tools = ("yt-dlp",)

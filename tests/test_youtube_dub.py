@@ -230,6 +230,16 @@ class ConcurrencyTests(unittest.TestCase):
         with self.assertRaises(youtube_dub.PipelineError):
             youtube_dub.validate_args(args)
 
+        args.transcribe_workers = 1
+        args.voice_sample_expires = 59
+        with self.assertRaises(youtube_dub.PipelineError):
+            youtube_dub.validate_args(args)
+
+        args.voice_sample_expires = 900
+        args.voice_enrollment_timeout = 0
+        with self.assertRaises(youtube_dub.PipelineError):
+            youtube_dub.validate_args(args)
+
     def test_transcription_runs_concurrently_and_restores_id_order(self):
         args = argparse.Namespace(
             force=True,
@@ -372,6 +382,324 @@ class ConcurrencyTests(unittest.TestCase):
 
         self.assertGreaterEqual(maximum_active, 2)
         self.assertEqual(sorted(prepared), [0, 1, 2, 3])
+
+    def test_aliyun_voice_enrollment_is_default_and_fixed_voice_is_explicit(self):
+        default_args = youtube_dub.build_parser().parse_args([])
+        fixed_args = youtube_dub.build_parser().parse_args(
+            ["--aliyun-voice-mode", "fixed", "--voice", "voice-123"]
+        )
+
+        self.assertEqual(default_args.aliyun_voice_mode, "source-clone")
+        self.assertEqual(
+            default_args.voice_sample_document_root,
+            Path("/srv/youtube-dub-voice-enroll"),
+        )
+        self.assertEqual(
+            default_args.voice_sample_secret_file,
+            Path("/etc/nginx/private-download/voice-enroll-secret"),
+        )
+        self.assertEqual(default_args.voice_sample_expires, 900)
+        self.assertEqual(default_args.voice_enrollment_timeout, 180.0)
+        self.assertEqual(fixed_args.aliyun_voice_mode, "fixed")
+        self.assertEqual(youtube_dub.aliyun_tts_voice(fixed_args), "voice-123")
+
+    def test_voice_customization_wraps_connection_errors(self):
+        args = argparse.Namespace(dashscope_base_url="https://workspace.example/api/v1")
+        with mock.patch.dict(
+            os.environ, {"DASHSCOPE_API_KEY": "secret"}
+        ), mock.patch.object(
+            youtube_dub.urllib.request,
+            "urlopen",
+            side_effect=youtube_dub.http.client.RemoteDisconnected("closed"),
+        ), self.assertRaises(youtube_dub.PipelineError):
+            youtube_dub.aliyun_voice_customization_request(
+                args,
+                {"model": "voice-enrollment", "input": {"action": "query_voice"}},
+            )
+
+    def test_create_aliyun_voice_sends_source_clone_payload(self):
+        args = argparse.Namespace(tts_model=youtube_dub.DEFAULT_TTS)
+        with mock.patch.object(
+            youtube_dub,
+            "aliyun_voice_customization_request",
+            return_value={"output": {"voice_id": "cosyvoice-v3.5-flash-ydabc-123"}},
+        ) as request:
+            voice_id = youtube_dub.create_aliyun_voice(
+                args,
+                "http://voice.example/sample.wav?signature=short-lived",
+                "ydabc123",
+            )
+
+        self.assertEqual(voice_id, "cosyvoice-v3.5-flash-ydabc-123")
+        request.assert_called_once_with(
+            args,
+            {
+                "model": "voice-enrollment",
+                "input": {
+                    "action": "create_voice",
+                    "target_model": "cosyvoice-v3.5-flash",
+                    "prefix": "ydabc123",
+                    "url": "http://voice.example/sample.wav?signature=short-lived",
+                    "language_hints": ["en"],
+                    "max_prompt_audio_length": 20.0,
+                    "enable_preprocess": True,
+                },
+            },
+        )
+
+    def test_create_aliyun_voice_does_not_leak_signed_sample_url_on_error(self):
+        signed_url = "http://voice.example/sample.wav?md5=secret-signature"
+        args = argparse.Namespace(tts_model=youtube_dub.DEFAULT_TTS)
+        with mock.patch.object(
+            youtube_dub,
+            "aliyun_voice_customization_request",
+            return_value={
+                "message": f"download failed: {signed_url}",
+                "request_id": "request-1",
+            },
+        ), self.assertRaises(youtube_dub.PipelineError) as raised:
+            youtube_dub.create_aliyun_voice(args, signed_url, "ydabc123")
+
+        self.assertNotIn(signed_url, str(raised.exception))
+        self.assertIn("request-1", str(raised.exception))
+
+    def test_create_aliyun_voice_handles_null_output(self):
+        args = argparse.Namespace(tts_model=youtube_dub.DEFAULT_TTS)
+        with mock.patch.object(
+            youtube_dub,
+            "aliyun_voice_customization_request",
+            return_value={"output": None, "request_id": "request-null"},
+        ), self.assertRaisesRegex(youtube_dub.PipelineError, "request-null"):
+            youtube_dub.create_aliyun_voice(
+                args, "http://voice.example/sample.wav", "ydabc123"
+            )
+
+    def test_wait_for_aliyun_voice_polls_until_ready(self):
+        args = argparse.Namespace()
+        responses = [
+            {"output": {"status": "DEPLOYING"}},
+            {
+                "output": {
+                    "status": "OK",
+                    "target_model": "cosyvoice-v3.5-flash",
+                }
+            },
+        ]
+        with mock.patch.object(
+            youtube_dub,
+            "aliyun_voice_customization_request",
+            side_effect=responses,
+        ) as request, mock.patch.object(youtube_dub.time, "sleep") as sleep:
+            status = youtube_dub.wait_for_aliyun_voice(
+                args,
+                "cosyvoice-v3.5-flash-ydabc-123",
+                expected_model="cosyvoice-v3.5-flash",
+                timeout_seconds=30,
+                poll_seconds=2,
+            )
+
+        self.assertEqual(status["status"], "OK")
+        self.assertEqual(request.call_count, 2)
+        request.assert_called_with(
+            args,
+            {
+                "model": "voice-enrollment",
+                "input": {
+                    "action": "query_voice",
+                    "voice_id": "cosyvoice-v3.5-flash-ydabc-123",
+                },
+            },
+        )
+        sleep.assert_called_once_with(2)
+
+    def test_wait_for_aliyun_voice_handles_null_output(self):
+        with mock.patch.object(
+            youtube_dub,
+            "aliyun_voice_customization_request",
+            return_value={"output": None, "request_id": "query-null"},
+        ), self.assertRaisesRegex(youtube_dub.PipelineError, "query-null"):
+            youtube_dub.wait_for_aliyun_voice(
+                argparse.Namespace(),
+                "voice-123",
+                expected_model="cosyvoice-v3.5-flash",
+            )
+
+    def test_prepare_aliyun_voice_creates_registers_and_revokes_sample(self):
+        args = argparse.Namespace(
+            tts_backend="aliyun-cosyvoice",
+            tts_model=youtube_dub.DEFAULT_TTS,
+            voice=youtube_dub.DEFAULT_VOICE,
+            aliyun_voice_mode="source-clone",
+            voice_sample_base_url="http://voice.example",
+            voice_sample_document_root=Path("/srv/voice"),
+            voice_sample_secret_file=Path("/etc/voice-secret"),
+            voice_sample_expires=900,
+            voice_enrollment_timeout=30.0,
+            force=False,
+            url="https://www.youtube.com/watch?v=video123",
+        )
+        segments = [youtube_dub.Segment(0, 4.0, 14.0, "English speech")]
+        with tempfile.TemporaryDirectory() as folder:
+            workdir = Path(folder)
+            source = workdir / "source_audio.wav"
+            source.write_bytes(b"source")
+
+            def fake_extract(_source, destination, start, end):
+                self.assertEqual((start, end), (0.0, 20.0))
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(b"RIFF" + b"sample" * 20)
+
+            with mock.patch.object(
+                youtube_dub, "probe_duration", return_value=60.0
+            ), mock.patch.object(
+                youtube_dub, "extract_voice_enrollment_sample", side_effect=fake_extract
+            ), mock.patch.object(
+                youtube_dub,
+                "publish_voice_enrollment_sample",
+                return_value={"url": "http://voice.example/signed.wav", "token": "token"},
+            ) as publish, mock.patch.object(
+                youtube_dub,
+                "create_aliyun_voice",
+                return_value="cosyvoice-v3.5-flash-yd123-voice",
+            ) as create, mock.patch.object(
+                youtube_dub,
+                "wait_for_aliyun_voice",
+                return_value={
+                    "status": "OK",
+                    "target_model": "cosyvoice-v3.5-flash",
+                    "resource_link": "http://voice.example/signed.wav?secret=1",
+                },
+            ) as wait, mock.patch.object(
+                youtube_dub, "revoke_voice_enrollment_sample"
+            ) as revoke:
+                voice_id = youtube_dub.prepare_aliyun_voice(
+                    args, workdir, source, segments
+                )
+
+            registry = youtube_dub.read_json(
+                workdir / "segments" / "aliyun_voice_enrollment.json"
+            )
+
+        self.assertEqual(voice_id, "cosyvoice-v3.5-flash-yd123-voice")
+        self.assertEqual(args.resolved_aliyun_voice, voice_id)
+        self.assertEqual(registry["voice_id"], voice_id)
+        self.assertEqual(registry["status"], "OK")
+        self.assertNotIn("resource_link", json.dumps(registry))
+        publish.assert_called_once()
+        create.assert_called_once()
+        wait.assert_called_once()
+        revoke.assert_called_once_with(args, "token")
+
+    def test_prepare_aliyun_voice_reuses_registered_voice(self):
+        args = argparse.Namespace(
+            tts_backend="aliyun-cosyvoice",
+            tts_model=youtube_dub.DEFAULT_TTS,
+            voice=youtube_dub.DEFAULT_VOICE,
+            aliyun_voice_mode="source-clone",
+            voice_enrollment_timeout=30.0,
+            force=False,
+            url="https://www.youtube.com/watch?v=video123",
+        )
+        segments = [youtube_dub.Segment(0, 4.0, 14.0, "English speech")]
+        with tempfile.TemporaryDirectory() as folder:
+            workdir = Path(folder)
+            source = workdir / "source_audio.wav"
+            source.write_bytes(b"source")
+            stat = source.stat()
+            registry_path = workdir / "segments" / "aliyun_voice_enrollment.json"
+            youtube_dub.write_json(
+                registry_path,
+                {
+                    "request": {
+                        "source_size": stat.st_size,
+                        "source_mtime_ns": stat.st_mtime_ns,
+                        "source_sha256": youtube_dub.file_sha256(source),
+                        "sample_start": 0.0,
+                        "sample_end": 20.0,
+                        "target_model": "cosyvoice-v3.5-flash",
+                    },
+                    "voice_id": "cosyvoice-v3.5-flash-cached",
+                    "status": "OK",
+                },
+            )
+            with mock.patch.object(
+                youtube_dub, "probe_duration", return_value=60.0
+            ), mock.patch.object(
+                youtube_dub,
+                "wait_for_aliyun_voice",
+                return_value={"status": "OK", "target_model": "cosyvoice-v3.5-flash"},
+            ) as wait, mock.patch.object(
+                youtube_dub, "create_aliyun_voice"
+            ) as create:
+                voice_id = youtube_dub.prepare_aliyun_voice(
+                    args, workdir, source, segments
+                )
+
+        self.assertEqual(voice_id, "cosyvoice-v3.5-flash-cached")
+        wait.assert_called_once()
+        create.assert_not_called()
+
+    def test_main_prepares_source_clone_before_synthesis(self):
+        segments = [youtube_dub.Segment(0, 0.0, 10.0, "Speech")]
+        with tempfile.TemporaryDirectory() as folder, mock.patch.object(
+            youtube_dub, "validate_args"
+        ), mock.patch.object(
+            youtube_dub, "require_tools"
+        ), mock.patch.object(
+            youtube_dub, "ensure_manifest"
+        ), mock.patch.object(
+            youtube_dub,
+            "download_media",
+            return_value=(Path(folder) / "source.mp4", Path(folder) / "source_audio.wav"),
+        ), mock.patch.object(
+            youtube_dub, "transcribe_audio", return_value=segments
+        ), mock.patch.object(
+            youtube_dub, "read_json", return_value={"words": []}
+        ), mock.patch.object(
+            youtube_dub, "polish_transcript", return_value=segments
+        ), mock.patch.object(
+            youtube_dub, "translate_segments", return_value=segments
+        ), mock.patch.object(
+            youtube_dub,
+            "prepare_aliyun_voice",
+            return_value="cosyvoice-v3.5-flash-dynamic",
+        ) as prepare, mock.patch.object(
+            youtube_dub, "synthesize_dub", return_value=Path(folder) / "dub.wav"
+        ) as synthesize:
+            result = youtube_dub.main(
+                [
+                    "https://www.youtube.com/watch?v=video123",
+                    "--workdir",
+                    folder,
+                    "--full",
+                    "--stop-after",
+                    "synthesize",
+                ]
+            )
+
+        self.assertEqual(result, 0)
+        prepare.assert_called_once_with(
+            mock.ANY, Path(folder), Path(folder) / "source_audio.wav", segments
+        )
+        synthesize.assert_called_once()
+
+    def test_voice_enrollment_uses_retained_audio_for_full_video(self):
+        with tempfile.TemporaryDirectory() as folder:
+            workdir = Path(folder)
+            fallback = workdir / "source_audio.wav"
+            retained = workdir / "source_audio_original.webm"
+            fallback.write_bytes(b"transcription audio")
+            retained.write_bytes(b"high quality audio")
+
+            selected = youtube_dub.voice_enrollment_source_audio(
+                argparse.Namespace(full=True), workdir, fallback
+            )
+            debug_selected = youtube_dub.voice_enrollment_source_audio(
+                argparse.Namespace(full=False), workdir, fallback
+            )
+
+        self.assertEqual(selected, retained)
+        self.assertEqual(debug_selected, fallback)
 
     def test_aliyun_cosyvoice_request_uses_fixed_voice_and_downloads_wav(self):
         args = argparse.Namespace(

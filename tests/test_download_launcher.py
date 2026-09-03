@@ -52,7 +52,8 @@ class SkillLauncherTests(unittest.TestCase):
             secrets.mkdir()
             (secrets / "dashscope.env").write_text(
                 "DASHSCOPE_API_KEY='test-key'\n"
-                "ALIYUN_COSYVOICE_VOICE=cosyvoice-v3.5-flash-test\n",
+                "ALIYUN_COSYVOICE_VOICE=cosyvoice-v3.5-flash-test\n"
+                "YOUTUBE_DUB_VOICE_SAMPLE_BASE_URL=http://voice.example\n",
                 encoding="utf-8",
             )
             with mock.patch.dict(
@@ -69,6 +70,10 @@ class SkillLauncherTests(unittest.TestCase):
             self.assertEqual(
                 environment["ALIYUN_COSYVOICE_VOICE"],
                 "cosyvoice-v3.5-flash-test",
+            )
+            self.assertEqual(
+                environment["YOUTUBE_DUB_VOICE_SAMPLE_BASE_URL"],
+                "http://voice.example",
             )
 
     def test_title_directory_replaces_whitespace_with_hyphens(self):
@@ -178,6 +183,29 @@ class SkillLauncherTests(unittest.TestCase):
     def test_default_pipeline_requires_dashscope(self):
         args = argparse.Namespace(download_only=False, download_cover=False)
         self.assertTrue(launcher.needs_dashscope(args, []))
+
+    def test_source_clone_requires_sample_host_not_fixed_voice(self):
+        environment = {
+            "DASHSCOPE_API_KEY": "test-key",
+            "YOUTUBE_DUB_VOICE_SAMPLE_BASE_URL": "http://voice.example",
+        }
+        self.assertIsNone(launcher.aliyun_configuration_error(environment, []))
+        self.assertIn(
+            "VOICE_SAMPLE_BASE_URL",
+            launcher.aliyun_configuration_error({"DASHSCOPE_API_KEY": "test-key"}, []),
+        )
+
+    def test_fixed_voice_mode_requires_configured_voice_id(self):
+        environment = {"DASHSCOPE_API_KEY": "test-key"}
+        passthrough = ["--aliyun-voice-mode", "fixed"]
+        self.assertIn(
+            "ALIYUN_COSYVOICE_VOICE",
+            launcher.aliyun_configuration_error(environment, passthrough),
+        )
+        environment["ALIYUN_COSYVOICE_VOICE"] = "voice-123"
+        self.assertIsNone(
+            launcher.aliyun_configuration_error(environment, passthrough)
+        )
 
     def test_mai_pipeline_requires_openrouter(self):
         args = argparse.Namespace(download_only=False)

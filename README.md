@@ -12,9 +12,9 @@ Skill 目录后即可调用；
 - 生成通用硬字幕版需要中文字体，Ubuntu/Debian 推荐安装 `fonts-noto-cjk`；
 - 完整配音需要调用 Skill 的 Agent 能使用其当前配置的后端模型完成结构化文本任务；
 - 英文词级转录默认在本地运行 `faster-whisper medium.en`（CPU INT8），无需转录 API 费用；
-- 默认中文配音使用阿里云百炼 `cosyvoice-v3.5-flash` 固定复刻/设计音色；本地 Fun-CosyVoice3-0.5B 仍可作为显式回退后端；
+- 默认中文配音会从当前视频提取 20 秒英文原声，为 `cosyvoice-v3.5-flash` 自动创建并复用该视频专属音色；本地 Fun-CosyVoice3-0.5B 仍可作为显式回退后端；
 - 默认使用本地 Demucs `htdemucs` 分离英文人声并保留背景音乐；首次使用会下载模型权重；
-- 默认云端配音需要北京地域的 `DASHSCOPE_API_KEY` 和匹配模型的 `voice_id`；仅在选择 `--tts-backend mai` 或远程 Whisper 时需要 `OPENROUTER_API_KEY`；
+- 默认云端配音需要北京地域的 `DASHSCOPE_API_KEY` 和一个可供阿里云短时下载样本的公网 URL；仅在固定音色模式下需要预先创建的 `voice_id`；
 - 推荐安装 Node.js，供 `yt-dlp` 处理 YouTube JavaScript 校验。
 
 纯下载模式只需要 Python、`yt-dlp`、`ffmpeg` 和 `ffprobe`，不需要
@@ -44,6 +44,9 @@ python3 -m venv .venv
 # 权限为 0600 的 .secrets/dashscope.env；该目录已被 .gitignore 排除。
 export DASHSCOPE_API_KEY='北京地域的百炼 API Key'
 export DASHSCOPE_WORKSPACE_ID='业务空间 ID'
+export YOUTUBE_DUB_VOICE_SAMPLE_BASE_URL='https://可信的临时样本服务'
+
+# 仅用于显式固定音色模式：
 export ALIYUN_COSYVOICE_VOICE='cosyvoice-v3.5-flash-...'
 
 # 可选的本地回退后端：依照 CosyVoice 官方说明创建独立环境并取得模型。
@@ -126,7 +129,7 @@ sudo apt-get install fonts-noto-cjk
 2. 在本地按静音点切分音频，使用共享的 `faster-whisper medium.en` 模型取得每个英文词的真实起止时间并换算成全片绝对时间；
 3. 由调用 Skill 的 Agent 当前后端模型跨越原始切块检查英文语法和 ASR 重复词，再把完整句子按词序对齐回真实词级时间轴；句间原始停顿会被保留；
 4. 由同一 Agent 后端模型识别主题，以领域专家口吻翻译为简体中文，并锁定校对后句子的时间戳；
-5. 默认用阿里云 `cosyvoice-v3.5-flash` 和一个固定复刻/设计音色并发生成中文；也可显式切换到本地逐句源音色克隆或 MAI-Voice-2；
+5. 默认从当前视频最长的英文句子附近提取 20 秒样本，创建并复用该视频专属的阿里云 `cosyvoice-v3.5-flash` 音色，再并发生成中文；也可显式切换到固定云端音色、本地逐句源音色克隆或 MAI-Voice-2；
 6. 超过舒适语速上限的句子会由同一 Agent 后端模型精简并重新生成；Demucs 从高质量原始音频中移除英文人声，`ffmpeg` 在中文说话时自动压低背景声并与中文配音混合；最后同时输出带可开关软字幕的通用版，以及把中文字幕烧录进画面的跨平台硬字幕版。
 
 ### 当前 VPS 的 CPU 优化默认值
@@ -142,18 +145,20 @@ Whisper 分段从 97.58 秒降至 79.25 秒，45 秒 Demucs 分离从 81.31 秒
 
 英文校对、主题识别、简体中文翻译和超时译文精简使用调用 Skill 的 Agent 当前后端模型。管线会生成带 JSON Schema 的文件请求；Agent 完成请求后写入同目录的响应文件并重跑原命令。该交换协议不依赖任何特定 Agent 或模型 CLI，详见 [`references/agent-text-backend.md`](references/agent-text-backend.md)。
 
-默认阿里云配音只从环境变量读取鉴权信息。`cosyvoice-v3.5-flash` 没有系统音色，
-需要先在华北2（北京）创建与该模型绑定的复刻/设计音色：
+默认阿里云配音从当前视频自动创建专属音色。`cosyvoice-v3.5-flash` 没有系统音色，
+因此需要华北2（北京）的凭据和临时样本服务：
 
 ```bash
 export DASHSCOPE_API_KEY='北京地域的百炼 API Key'
 export DASHSCOPE_WORKSPACE_ID='业务空间 ID'  # 推荐；省略时使用兼容的通用端点
-export ALIYUN_COSYVOICE_VOICE='cosyvoice-v3.5-flash-...'
+export YOUTUBE_DUB_VOICE_SAMPLE_BASE_URL='https://可信的临时样本服务'
 ```
 
-不要将 API Key 放入命令参数、源码或版本库。`voice_id` 可由 `--voice` 覆盖；
-模型默认为 `cosyvoice-v3.5-flash`，输出会立即下载成 24 kHz WAV，避免依赖
-阿里云返回的临时音频 URL。
+流水线会把 `voice_id` 和源音频指纹写入
+`segments/aliyun_voice_enrollment.json`，恢复任务时先查询并复用现有音色，不会重复创建；
+临时样本在音色就绪或失败后立即撤销。注册表不保存签名 URL 或阿里云返回的
+`resource_link`。若要继续使用预先创建的固定音色，显式传入
+`--aliyun-voice-mode fixed`，并通过 `ALIYUN_COSYVOICE_VOICE` 或 `--voice` 提供 ID。
 
 ### 无域名时的临时声音样本 URL
 
@@ -170,8 +175,7 @@ sudo python3 scripts/nginx_voice_sample.py publish sample.wav \
   --base-url 'http://<PUBLIC_IPV4>'
 ```
 
-将返回 JSON 中的 `url` 立即交给阿里云 `voice-enrollment`。创建音色成功后，
-用 URL 或 token 撤销样本：
+主流水线会自动发布、注册、轮询至 `OK` 并撤销样本。以下命令仅用于手工诊断：
 
 ```bash
 sudo python3 scripts/nginx_voice_sample.py revoke 'RETURNED_URL'

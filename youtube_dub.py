@@ -331,6 +331,13 @@ def aliyun_tts_model(args: argparse.Namespace) -> str:
 
 
 def aliyun_tts_voice(args: argparse.Namespace, *, required: bool = True) -> str:
+    if getattr(args, "aliyun_voice_mode", "fixed") == "source-clone":
+        resolved = getattr(args, "resolved_aliyun_voice", None)
+        if resolved:
+            return str(resolved)
+        if not required:
+            return "source-clone:pending"
+        raise PipelineError("当前视频的阿里云复刻音色尚未创建")
     configured = os.environ.get("ALIYUN_COSYVOICE_VOICE")
     if args.voice != DEFAULT_VOICE:
         configured = args.voice
@@ -356,6 +363,291 @@ def dashscope_base_url(args: argparse.Namespace) -> str:
             raise PipelineError("DASHSCOPE_WORKSPACE_ID 格式不正确")
         return f"https://{workspace_id}.cn-beijing.maas.aliyuncs.com/api/v1"
     return DASHSCOPE_DEFAULT_BASE_URL
+
+
+def aliyun_voice_customization_request(
+    args: argparse.Namespace, payload: dict[str, Any]
+) -> dict[str, Any]:
+    api_key = require_dashscope_api_key()
+    endpoint = dashscope_base_url(args) + "/services/audio/tts/customization"
+    request = urllib.request.Request(
+        endpoint,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            document = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        details = exc.read().decode("utf-8", errors="replace")
+        try:
+            summary = aliyun_error_summary(json.loads(details))
+        except (json.JSONDecodeError, TypeError, ValueError):
+            summary = "响应内容已省略"
+        raise PipelineError(f"阿里云声音复刻 HTTP {exc.code}: {summary}") from exc
+    except (
+        urllib.error.URLError,
+        TimeoutError,
+        ConnectionError,
+        http.client.HTTPException,
+        json.JSONDecodeError,
+    ) as exc:
+        raise PipelineError(f"阿里云声音复刻请求失败：{exc}") from exc
+    if not isinstance(document, dict):
+        raise PipelineError("阿里云声音复刻返回了无效响应")
+    return document
+
+
+def aliyun_error_summary(document: object) -> str:
+    if not isinstance(document, dict):
+        return "未返回错误详情"
+    fields = [
+        f"{name}={document[name]}"
+        for name in ("code", "request_id")
+        if document.get(name) is not None
+    ]
+    return ", ".join(fields) or "未返回错误详情"
+
+
+def create_aliyun_voice(
+    args: argparse.Namespace, sample_url: str, prefix: str
+) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9]{1,10}", prefix):
+        raise PipelineError("阿里云复刻音色 prefix 必须是最多 10 位数字或英文字母")
+    if urllib.parse.urlparse(sample_url).scheme not in {"http", "https"}:
+        raise PipelineError("声音复刻样本必须使用公网 HTTP(S) URL")
+    document = aliyun_voice_customization_request(
+        args,
+        {
+            "model": "voice-enrollment",
+            "input": {
+                "action": "create_voice",
+                "target_model": aliyun_tts_model(args),
+                "prefix": prefix,
+                "url": sample_url,
+                "language_hints": ["en"],
+                "max_prompt_audio_length": 20.0,
+                "enable_preprocess": True,
+            },
+        },
+    )
+    output = document.get("output")
+    voice_id = str(output.get("voice_id", "") if isinstance(output, dict) else "").strip()
+    if not voice_id:
+        raise PipelineError(
+            f"阿里云声音复刻未返回 voice_id：{aliyun_error_summary(document)}"
+        )
+    return voice_id
+
+
+def wait_for_aliyun_voice(
+    args: argparse.Namespace,
+    voice_id: str,
+    *,
+    expected_model: str,
+    timeout_seconds: float = 180.0,
+    poll_seconds: float = 3.0,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        document = aliyun_voice_customization_request(
+            args,
+            {
+                "model": "voice-enrollment",
+                "input": {"action": "query_voice", "voice_id": voice_id},
+            },
+        )
+        raw_output = document.get("output")
+        output = raw_output if isinstance(raw_output, dict) else {}
+        status = str(output.get("status", "")).upper()
+        if status == "OK":
+            target_model = str(output.get("target_model", ""))
+            if target_model and target_model != expected_model:
+                raise PipelineError(
+                    f"复刻音色绑定模型 {target_model} 与 TTS 模型 {expected_model} 不一致"
+                )
+            return dict(output)
+        if status == "UNDEPLOYED":
+            raise PipelineError(f"阿里云声音复刻审核未通过：{voice_id}")
+        if status != "DEPLOYING":
+            raise PipelineError(
+                f"阿里云返回未知音色状态：{aliyun_error_summary(document)}"
+            )
+        if time.monotonic() + poll_seconds > deadline:
+            raise PipelineError(f"等待阿里云复刻音色就绪超时：{voice_id}")
+        time.sleep(poll_seconds)
+
+
+def voice_enrollment_window(
+    segments: Sequence[Segment], source_duration: float, target_seconds: float = 20.0
+) -> tuple[float, float]:
+    if source_duration < 5.0:
+        raise PipelineError("原视频有效音频不足 5 秒，无法创建复刻音色")
+    if not segments:
+        raise PipelineError("英文转录没有可用于声音复刻的语音片段")
+    anchor = max(segments, key=lambda item: item.duration)
+    duration = min(target_seconds, source_duration)
+    center = (anchor.start + anchor.end) / 2
+    start = max(0.0, min(center - duration / 2, source_duration - duration))
+    return round(start, 3), round(start + duration, 3)
+
+
+def extract_voice_enrollment_sample(
+    source: Path, destination: Path, start: float, end: float
+) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-ss",
+            f"{start:.3f}",
+            "-t",
+            f"{end - start:.3f}",
+            "-i",
+            str(source),
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "24000",
+            "-c:a",
+            "pcm_s16le",
+            str(destination),
+        ]
+    )
+
+
+def publish_voice_enrollment_sample(
+    args: argparse.Namespace, sample: Path
+) -> dict[str, object]:
+    from scripts import nginx_voice_sample
+
+    base_url = getattr(args, "voice_sample_base_url", None) or os.environ.get(
+        "YOUTUBE_DUB_VOICE_SAMPLE_BASE_URL"
+    )
+    if not base_url:
+        raise PipelineError(
+            "自动声音复刻需要 --voice-sample-base-url 或 "
+            "YOUTUBE_DUB_VOICE_SAMPLE_BASE_URL"
+        )
+    try:
+        return nginx_voice_sample.publish(
+            argparse.Namespace(
+                source=sample,
+                base_url=base_url,
+                expires_in=args.voice_sample_expires,
+                secret_file=args.voice_sample_secret_file,
+                document_root=args.voice_sample_document_root,
+            )
+        )
+    except (OSError, ValueError) as exc:
+        raise PipelineError(f"发布声音复刻样本失败：{exc}") from exc
+
+
+def revoke_voice_enrollment_sample(args: argparse.Namespace, token_or_url: str) -> None:
+    from scripts import nginx_voice_sample
+
+    try:
+        nginx_voice_sample.revoke(
+            argparse.Namespace(
+                document_root=args.voice_sample_document_root,
+                token_or_url=token_or_url,
+            )
+        )
+    except (OSError, ValueError) as exc:
+        log(f"警告：撤销临时声音样本失败：{exc}")
+
+
+def voice_enrollment_source_audio(
+    args: argparse.Namespace, workdir: Path, fallback: Path
+) -> Path:
+    if getattr(args, "full", False):
+        retained = find_standardized_stream(workdir, "source", "audio")
+        if retained is not None:
+            return retained
+    return fallback
+
+
+def prepare_aliyun_voice(
+    args: argparse.Namespace,
+    workdir: Path,
+    source_audio: Path,
+    segments: Sequence[Segment],
+) -> str:
+    if getattr(args, "aliyun_voice_mode", "fixed") == "fixed":
+        return aliyun_tts_voice(args)
+
+    model = aliyun_tts_model(args)
+    enrollment_audio = voice_enrollment_source_audio(args, workdir, source_audio)
+    source_stat = enrollment_audio.stat()
+    start, end = voice_enrollment_window(segments, probe_duration(enrollment_audio))
+    requested = {
+        "source_size": source_stat.st_size,
+        "source_mtime_ns": source_stat.st_mtime_ns,
+        "source_sha256": file_sha256(enrollment_audio),
+        "sample_start": start,
+        "sample_end": end,
+        "target_model": model,
+    }
+    registry_path = workdir / "segments" / "aliyun_voice_enrollment.json"
+    cached = read_json(registry_path) if registry_path.exists() else {}
+    if not args.force and cached.get("request") == requested and cached.get("voice_id"):
+        voice_id = str(cached["voice_id"])
+        status = wait_for_aliyun_voice(
+            args,
+            voice_id,
+            expected_model=model,
+            timeout_seconds=args.voice_enrollment_timeout,
+        )
+        cached["status"] = status.get("status", "OK")
+        cached["target_model"] = status.get("target_model", model)
+        write_json(registry_path, cached)
+        args.resolved_aliyun_voice = voice_id
+        log(f"复用当前视频的阿里云复刻音色：{voice_id}")
+        return voice_id
+
+    sample = workdir / "segments" / "voice_enrollment" / "sample.wav"
+    extract_voice_enrollment_sample(enrollment_audio, sample, start, end)
+    sample_hash = hashlib.sha256(sample.read_bytes()).hexdigest()
+    published: dict[str, object] | None = None
+    try:
+        published = publish_voice_enrollment_sample(args, sample)
+        sample_url = str(published.get("url", ""))
+        prefix = "yd" + hashlib.sha256(args.url.encode("utf-8")).hexdigest()[:8]
+        log(f"为当前视频创建阿里云复刻音色（样本 {start:.1f}-{end:.1f} 秒）")
+        voice_id = create_aliyun_voice(args, sample_url, prefix)
+        registry = {
+            "request": requested,
+            "sample_sha256": sample_hash,
+            "voice_id": voice_id,
+            "status": "DEPLOYING",
+        }
+        write_json(registry_path, registry)
+        status = wait_for_aliyun_voice(
+            args,
+            voice_id,
+            expected_model=model,
+            timeout_seconds=args.voice_enrollment_timeout,
+        )
+        registry["status"] = status.get("status", "OK")
+        registry["target_model"] = status.get("target_model", model)
+        write_json(registry_path, registry)
+    finally:
+        if published:
+            token = str(published.get("token") or published.get("url") or "")
+            if token:
+                revoke_voice_enrollment_sample(args, token)
+    args.resolved_aliyun_voice = voice_id
+    log(f"当前视频的阿里云复刻音色已就绪：{voice_id}")
+    return voice_id
 
 
 def aliyun_cosyvoice_request(
@@ -3149,6 +3441,40 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--tts-model", default=DEFAULT_TTS)
     parser.add_argument("--voice", default=DEFAULT_VOICE)
+    parser.add_argument(
+        "--aliyun-voice-mode",
+        choices=("source-clone", "fixed"),
+        default="source-clone",
+        help="阿里云音色模式；默认从当前视频创建并复用专属 voice_id",
+    )
+    parser.add_argument(
+        "--voice-sample-base-url",
+        help="临时声音样本服务的公网 HTTP(S) 根地址",
+    )
+    parser.add_argument(
+        "--voice-sample-document-root",
+        type=Path,
+        default=Path("/srv/youtube-dub-voice-enroll"),
+        help="临时声音样本服务的本地文件根目录",
+    )
+    parser.add_argument(
+        "--voice-sample-secret-file",
+        type=Path,
+        default=Path("/etc/nginx/private-download/voice-enroll-secret"),
+        help="Nginx secure_link 签名密钥文件",
+    )
+    parser.add_argument(
+        "--voice-sample-expires",
+        type=int,
+        default=900,
+        help="临时声音样本 URL 有效秒数，默认 900",
+    )
+    parser.add_argument(
+        "--voice-enrollment-timeout",
+        type=float,
+        default=180.0,
+        help="等待阿里云复刻音色就绪的最长秒数，默认 180",
+    )
     parser.add_argument("--tts-speed", type=float, default=1.0)
     parser.add_argument(
         "--dashscope-base-url",
@@ -3310,6 +3636,10 @@ def validate_args(args: argparse.Namespace) -> None:
         )
     if not 1 <= args.tts_workers <= MAX_NETWORK_WORKERS:
         raise PipelineError(f"--tts-workers 必须在 1 到 {MAX_NETWORK_WORKERS} 之间")
+    if not 60 <= args.voice_sample_expires <= 3600:
+        raise PipelineError("--voice-sample-expires 必须在 60 到 3600 秒之间")
+    if args.voice_enrollment_timeout <= 0:
+        raise PipelineError("--voice-enrollment-timeout 必须大于 0")
     if not 1 <= args.fit_workers <= MAX_NETWORK_WORKERS:
         raise PipelineError(f"--fit-workers 必须在 1 到 {MAX_NETWORK_WORKERS} 之间")
     if not 0.5 <= args.tts_speed <= 2.0:
@@ -3424,6 +3754,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         chinese = translate_segments(args, workdir, english)
         if args.stop_after == "translate":
             return 0
+        if args.tts_backend == "aliyun-cosyvoice":
+            prepare_aliyun_voice(args, workdir, source_audio, english)
+            ensure_manifest(args, workdir)
         dub = synthesize_dub(args, workdir, chinese)
         if args.stop_after == "synthesize":
             return 0
