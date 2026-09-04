@@ -1022,6 +1022,50 @@ class BackgroundAudioTests(unittest.TestCase):
             self.assertTrue(metadata["complete"])
             self.assertEqual(metadata["request"]["model"], "htdemucs")
 
+    def test_long_demucs_background_is_processed_in_bounded_chunks(self):
+        args = self.background_args(demucs_jobs=2)
+        observed: list[list[str]] = []
+        with tempfile.TemporaryDirectory() as folder:
+            workdir = Path(folder)
+            video = workdir / "source.mp4"
+            retained = workdir / "source_audio_original.webm"
+            video.write_bytes(b"video")
+            retained.write_bytes(b"audio")
+
+            def fake_run(command, **_kwargs):
+                command = list(command)
+                observed.append(command)
+                if command[0] == "/venv/bin/demucs":
+                    output_root = Path(command[command.index("--out") + 1])
+                    source = Path(command[-1])
+                    stem = output_root / "htdemucs" / source.stem / "no_vocals.wav"
+                    stem.parent.mkdir(parents=True)
+                    stem.write_bytes(b"background chunk")
+                elif command[0] == "ffmpeg":
+                    Path(command[-1]).write_bytes(b"audio")
+                return mock.Mock()
+
+            with mock.patch.object(
+                youtube_dub, "probe_duration", return_value=620.0
+            ), mock.patch.object(
+                youtube_dub.shutil, "which", return_value="/venv/bin/demucs"
+            ), mock.patch.object(youtube_dub, "run", side_effect=fake_run):
+                result = youtube_dub.separate_background_audio(args, workdir, video)
+
+        demucs_commands = [item for item in observed if item[0] == "/venv/bin/demucs"]
+        self.assertEqual(len(demucs_commands), 3)
+        self.assertTrue(
+            all(item[item.index("--jobs") + 1] == "1" for item in demucs_commands)
+        )
+        extraction_commands = [
+            item for item in observed if item[0] == "ffmpeg" and "-ss" in item
+        ]
+        self.assertEqual(
+            [item[item.index("-t") + 1] for item in extraction_commands],
+            ["300.000", "300.000", "20.000"],
+        )
+        self.assertEqual(result.name, "background_audio.wav")
+
     def test_mix_uses_sidechain_ducking_and_is_cached(self):
         args = self.background_args()
         observed: list[list[str]] = []

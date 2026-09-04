@@ -55,7 +55,8 @@ TEXT_PIPELINE_VERSION = 4
 TIMESTAMP_PIPELINE_VERSION = 1
 ALIGNMENT_PIPELINE_VERSION = 2
 HARDSUB_RENDER_VERSION = 2
-BACKGROUND_AUDIO_PIPELINE_VERSION = 1
+BACKGROUND_AUDIO_PIPELINE_VERSION = 2
+DEMUCS_CHUNK_SECONDS = 300.0
 DEFAULT_BACKGROUND_MODE = "demucs"
 DEFAULT_DEMUCS_MODEL = "htdemucs"
 DEFAULT_BACKGROUND_VOLUME = 0.7
@@ -2960,34 +2961,120 @@ def separate_background_audio(
             "或使用 --background-mode none 生成纯中文配音。"
         )
 
+    temporary_output = output.with_name(output.stem + ".tmp" + output.suffix)
     separation_root = (
         workdir / "segments" / "demucs" / json_fingerprint(requested)[:12]
     )
     separation_root.mkdir(parents=True, exist_ok=True)
-    command = [
-        demucs,
-        "--two-stems",
-        "vocals",
-        "--name",
-        args.demucs_model,
-        "--out",
-        str(separation_root),
-        "--float32",
-        "--jobs",
-        str(args.demucs_jobs),
-    ]
-    if args.demucs_device != "auto":
-        command.extend(["--device", args.demucs_device])
-    command.append(str(source))
-    log(f"使用 Demucs {args.demucs_model} 分离英文人声与背景声")
-    run(command)
+    source_duration = probe_duration(source)
 
-    candidates = sorted(separation_root.rglob("no_vocals.wav"))
-    if len(candidates) != 1:
-        found = ", ".join(str(path) for path in candidates) or "无"
-        raise PipelineError(f"Demucs 未生成唯一的 no_vocals.wav；找到：{found}")
-    temporary_output = output.with_name(output.stem + ".tmp" + output.suffix)
-    shutil.copyfile(candidates[0], temporary_output)
+    def demucs_command(input_audio: Path, output_root: Path, jobs: int) -> list[str]:
+        command = [
+            demucs,
+            "--two-stems",
+            "vocals",
+            "--name",
+            args.demucs_model,
+            "--out",
+            str(output_root),
+            "--float32",
+            "--jobs",
+            str(jobs),
+        ]
+        if args.demucs_device != "auto":
+            command.extend(["--device", args.demucs_device])
+        command.append(str(input_audio))
+        return command
+
+    log(f"使用 Demucs {args.demucs_model} 分离英文人声与背景声")
+    if source_duration <= DEMUCS_CHUNK_SECONDS:
+        run(demucs_command(source, separation_root, args.demucs_jobs))
+        candidates = sorted(separation_root.rglob("no_vocals.wav"))
+        if len(candidates) != 1:
+            found = ", ".join(str(path) for path in candidates) or "无"
+            raise PipelineError(f"Demucs 未生成唯一的 no_vocals.wav；找到：{found}")
+        shutil.copyfile(candidates[0], temporary_output)
+    else:
+        chunk_root = separation_root / "chunks"
+        input_root = chunk_root / "inputs"
+        output_root = chunk_root / "outputs"
+        input_root.mkdir(parents=True, exist_ok=True)
+        stems: list[Path] = []
+        chunk_count = math.ceil(source_duration / DEMUCS_CHUNK_SECONDS)
+        log(
+            f"长音轨按 {DEMUCS_CHUNK_SECONDS:.0f} 秒切为 {chunk_count} 块，"
+            "逐块单任务分离以限制内存"
+        )
+        for index in range(chunk_count):
+            start = index * DEMUCS_CHUNK_SECONDS
+            duration = min(DEMUCS_CHUNK_SECONDS, source_duration - start)
+            chunk_source = input_root / f"chunk_{index:04d}.wav"
+            chunk_output_root = output_root / f"chunk_{index:04d}"
+            stem = (
+                chunk_output_root
+                / args.demucs_model
+                / chunk_source.stem
+                / "no_vocals.wav"
+            )
+            if not stem.exists():
+                run(
+                    [
+                        "ffmpeg",
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-y",
+                        "-ss",
+                        f"{start:.3f}",
+                        "-t",
+                        f"{duration:.3f}",
+                        "-i",
+                        str(source),
+                        "-vn",
+                        "-ac",
+                        "2",
+                        "-ar",
+                        "44100",
+                        "-c:a",
+                        "pcm_f32le",
+                        str(chunk_source),
+                    ]
+                )
+                run(demucs_command(chunk_source, chunk_output_root, 1))
+            if not stem.exists():
+                raise PipelineError(f"Demucs 未生成分块背景声：{stem}")
+            stems.append(stem)
+
+        concat_manifest = chunk_root / "no_vocals.concat.txt"
+        concat_manifest.write_text(
+            "".join(
+                "file '" + str(path.resolve()).replace("'", "'\\''") + "'\n"
+                for path in stems
+            ),
+            encoding="utf-8",
+        )
+        run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                str(concat_manifest),
+                "-ar",
+                "44100",
+                "-ac",
+                "2",
+                "-c:a",
+                "pcm_s16le",
+                str(temporary_output),
+            ]
+        )
     temporary_output.replace(output)
     write_json(
         metadata_path,
