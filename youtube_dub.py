@@ -489,7 +489,14 @@ def voice_enrollment_window(
         raise PipelineError("原视频有效音频不足 5 秒，无法创建复刻音色")
     if not segments:
         raise PipelineError("英文转录没有可用于声音复刻的语音片段")
-    anchor = max(segments, key=lambda item: item.duration)
+    credible_speech = [
+        item
+        for item in segments
+        if len(re.findall(r"[A-Za-z0-9]+(?:['’-][A-Za-z0-9]+)*", item.text))
+        / max(item.duration, 0.001)
+        >= 0.5
+    ]
+    anchor = max(credible_speech or segments, key=lambda item: item.duration)
     duration = min(target_seconds, source_duration)
     center = (anchor.start + anchor.end) / 2
     start = max(0.0, min(center - duration / 2, source_duration - duration))

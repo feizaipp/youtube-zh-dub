@@ -97,6 +97,24 @@ class TimestampTests(unittest.TestCase):
         )
 
 
+class VoiceEnrollmentTests(unittest.TestCase):
+    def test_window_ignores_long_low_speech_density_credit_segment(self):
+        segments = [
+            youtube_dub.Segment(
+                0,
+                100.0,
+                128.0,
+                "They went around each other hundreds of times a second before merging into one larger black hole.",
+            ),
+            youtube_dub.Segment(1, 200.0, 247.0, "Thanks for watching!"),
+        ]
+
+        self.assertEqual(
+            youtube_dub.voice_enrollment_window(segments, 300.0),
+            (104.0, 124.0),
+        )
+
+
 class TextBatchingTests(unittest.TestCase):
     def test_polish_batches_split_only_after_complete_chunk_sentence(self):
         segments = [
