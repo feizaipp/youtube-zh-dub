@@ -6,6 +6,7 @@ import tempfile
 import threading
 import time
 import unittest
+import wave
 from pathlib import Path
 from unittest import mock
 
@@ -219,6 +220,38 @@ class AudioFilterTests(unittest.TestCase):
             1.15,
         )
         self.assertEqual([item.id for item in result], [1])
+
+    def test_subsecond_speech_borrows_following_silence_without_moving_subtitles(self):
+        # Real windows from the 316-line dub: neither utterance can be shortened
+        # without losing meaning, but both fit before the following sentence.
+        cases = [(228.447, 228.767, 228.847, 0.374),
+                 (626.022, 626.502, 627.102, 0.756)]
+        for index, (start, end, next_start, speech_duration) in enumerate(cases):
+            with self.subTest(index=index), tempfile.TemporaryDirectory() as folder:
+                segments = [
+                    youtube_dub.Segment(0, start, end, "MCP。"),
+                    youtube_dub.Segment(1, next_start, next_start + 1, "下一句。"),
+                ]
+                timestamps = [(item.start, item.end) for item in segments]
+                durations = {0: speech_duration, 1: 0.8}
+                self.assertEqual(youtube_dub.overlong_segments(segments, durations, 1.15), [])
+                source = Path(folder) / "speech.wav"
+                with wave.open(str(source), "wb") as audio:
+                    audio.setnchannels(1)
+                    audio.setsampwidth(2)
+                    audio.setframerate(24000)
+                    audio.writeframes(b"\x01\x00" * round(24000 * speech_duration))
+                prepared = {0: (source, speech_duration, "speech"),
+                            1: (source, 0.8, "next")}
+                args = argparse.Namespace(fit_workers=2, max_tempo=1.15)
+                files, reports = youtube_dub.fit_audio_segments(
+                    args, segments, prepared, Path(folder) / "fitted", next_start + 1
+                )
+                self.assertEqual([(item.start, item.end) for item in segments], timestamps)
+                self.assertLessEqual(reports[0]["tempo"], 1.15)
+                self.assertGreater(reports[0]["target_duration"], end - start)
+                self.assertLessEqual(start + reports[0]["target_duration"], next_start + 0.001)
+                self.assertAlmostEqual(youtube_dub.probe_duration(files[0]), next_start - start, places=2)
 
     def test_tts_trim_accepts_codec_rounded_hundred_milliseconds(self):
         with mock.patch.object(youtube_dub, "run"), mock.patch.object(

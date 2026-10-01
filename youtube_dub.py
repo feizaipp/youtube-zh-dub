@@ -2409,13 +2409,24 @@ def prepare_tts_sources(
     return prepared
 
 
+def speech_fit_duration(
+    segments: Sequence[Segment], position: int, generated_duration: float, max_tempo: float
+) -> float:
+    """Borrow only the following gap needed to keep speech within the tempo cap."""
+    segment = segments[position]
+    next_start = segments[position + 1].start if position + 1 < len(segments) else segment.end
+    return max(segment.duration, min(next_start - segment.start, generated_duration / max_tempo))
+
+
 def overlong_segments(
     segments: Sequence[Segment], durations: dict[int, float], max_tempo: float
 ) -> list[Segment]:
     return [
         segment
-        for segment in segments
-        if durations[segment.id] / segment.duration > max_tempo + 0.001
+        for position, segment in enumerate(segments)
+        if durations[segment.id]
+        / speech_fit_duration(segments, position, durations[segment.id], max_tempo)
+        > max_tempo + 0.001
     ]
 
 
@@ -2662,7 +2673,7 @@ def fit_audio_segments(
                 fit_audio_to_window,
                 source,
                 fitted,
-                segment.duration,
+                speech_fit_duration(segments, position, generated_duration, args.max_tempo),
                 args.max_tempo,
                 generated_duration=generated_duration,
                 output_duration=output_duration,
@@ -2763,7 +2774,7 @@ def synthesize_dub(
             "max_tempo": args.max_tempo,
             "edge_trim_version": 1,
             "adaptive_shortening_version": 2,
-            "timeline_silence_version": 3,
+            "timeline_silence_version": 4,
         }
         return hashlib.sha256(
             json.dumps(settings, ensure_ascii=False, sort_keys=True).encode("utf-8")
