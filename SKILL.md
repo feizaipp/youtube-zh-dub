@@ -73,6 +73,14 @@ When Alibaba Cloud voice enrollment uses this host's authorized Nginx endpoint, 
 
 Background preservation requires the project environment to have `demucs` installed (via `requirements.txt`); its model weights download on first use. If that dependency cannot be installed or the user requests a voice-only result, pass `--background-mode none` explicitly. Do not silently drop background audio after a Demucs failure.
 
+## Original-chapter production
+
+For strict original-chapter processing, inspect retained metadata first. `video_metadata.json` may contain only title/ID/URLs, not chapters. Retrieve full metadata with the project yt-dlp using `--skip-download --dump-single-json`; when source streams already exist but current format extraction fails, `--ignore-no-formats-error` permits metadata-only extraction without replacing media. Keep the result in the same video workdir.
+
+Adapt chapter orchestration and assembly to the actual metadata, measured duration, and paths. Never inherit another video's chapter count, endpoints, or padding constants. Accurately seek/re-encode chapter video boundaries, retain high-quality audio, and finish each chapter's text exchanges, TTS, background preservation, and validation before the next. Assemble exact-duration PCM mixes rather than AAC tracks to avoid cumulative priming. Already burned chapter video can be concatenated by stream copy and muxed with the assembled AAC to avoid another video generation; verify full decode, durations, and subtitle-bearing frames afterwards.
+
+Alibaba enrollment may transiently return `BadRequest.InputDownloadFailed` or HTTP 500 `Timeout` even when the signed sample downloads with HTTP 200 and a matching SHA-256. Verify delivery and revocation, then retry the unchanged pipeline a bounded number of times. Preserve caches; do not use `--force` or silently switch to a fixed voice. A transient CosyVoice engine error may also recover on an unchanged resume, reusing successful sentence WAVs.
+
 ## Debug economically
 
 The production pipeline has already been validated. Run the full workflow directly for an ordinary “转录 URL” request.
